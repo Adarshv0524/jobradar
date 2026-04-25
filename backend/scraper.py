@@ -17,6 +17,7 @@ from config import (
     ATS_DOMAINS, CRAWL_DELAY, FAKE_SIGNALS, MAX_RETRIES,
     REQUEST_TIMEOUT, TECH_SKILLS, USER_AGENTS,
 )
+from config import JS_HEAVY_DOMAINS, USE_PLAYWRIGHT, USE_SELENIUM, BROWSER_FIRST
 
 _last_req: Dict[str, float] = {}  # domain → last request timestamp
 
@@ -64,16 +65,16 @@ async def fetch_html(url: str, use_playwright_fallback: bool = False) -> Optiona
                         or "cf-challenge" in text.lower()
                         or "please verify" in text.lower()
                     ):
-                        from playwright_pool import fetch_with_playwright
-                        pw_html = await fetch_with_playwright(url)
+                        from browser_fetch import fetch_rendered
+                        pw_html = await fetch_rendered(url)
                         if pw_html and len(pw_html) > len(text):
                             return pw_html
                     return text
                 if r.status_code == 403:
                     # Try Playwright on 403 (Cloudflare, etc.)
                     if use_playwright_fallback:
-                        from playwright_pool import fetch_with_playwright
-                        return await fetch_with_playwright(url)
+                        from browser_fetch import fetch_rendered
+                        return await fetch_rendered(url)
                     return None
                 if r.status_code in (429, 503):
                     wait_time = 4 * (attempt + 1) + random.uniform(0, 2)
@@ -88,8 +89,8 @@ async def fetch_html(url: str, use_playwright_fallback: bool = False) -> Optiona
 
     # Last resort: try Playwright
     if use_playwright_fallback:
-        from playwright_pool import fetch_with_playwright
-        return await fetch_with_playwright(url)
+        from browser_fetch import fetch_rendered
+        return await fetch_rendered(url)
     return None
 
 
@@ -101,34 +102,101 @@ async def search_web(query: str, max_results: int = 10) -> List[Dict]:
         from duckduckgo_search import DDGS
         results = []
         with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=max_results, timelimit="m"):
+            for r in ddgs.text(query, max_results=max_results):
                 results.append({
                     "url":     r.get("href", ""),
                     "title":   r.get("title", ""),
                     "snippet": r.get("body", ""),
                 })
-        return [r for r in results if r["url"]]
+        cleaned = [r for r in results if r["url"]]
+        if cleaned:
+            return cleaned
     except Exception:
-        return await _ddg_html_fallback(query, max_results)
+        pass
+
+    html_results = await _ddg_html_fallback(query, max_results)
+    if html_results:
+        return html_results
+
+    # Final lightweight fallback: try a few reformulations before giving up.
+    alt_queries = []
+    q = query.strip()
+    if "site:" not in q:
+        alt_queries.extend([
+            f"{q} jobs",
+            f"{q} careers",
+            f"{q} openings",
+            f"site:jobs.lever.co {q}",
+            f"site:boards.greenhouse.io {q}",
+        ])
+    else:
+        alt_queries.extend([
+            q.replace(" India", "").replace(" india", ""),
+            q.replace(" intern", "").replace(" fresher", "").replace(" junior", ""),
+        ])
+
+    seen = set()
+    for alt in alt_queries:
+        alt = " ".join(alt.split()).strip()
+        if not alt or alt == q or alt in seen:
+            continue
+        seen.add(alt)
+        try:
+            from duckduckgo_search import DDGS
+            with DDGS() as ddgs:
+                batch = [{
+                    "url": r.get("href", ""),
+                    "title": r.get("title", ""),
+                    "snippet": r.get("body", ""),
+                } for r in ddgs.text(alt, max_results=max_results)]
+            batch = [r for r in batch if r["url"]]
+            if batch:
+                return batch
+        except Exception:
+            batch = await _ddg_html_fallback(alt, max_results)
+            if batch:
+                return batch
+
+    return []
 
 
 async def _ddg_html_fallback(query: str, max_results: int) -> List[Dict]:
-    url  = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-    html = await fetch_html(url)
-    if not html:
-        return []
-    soup = BeautifulSoup(html, "html.parser")
-    out  = []
-    for el in soup.select(".result")[:max_results]:
-        a   = el.select_one(".result__a")
-        snip = el.select_one(".result__snippet")
-        if a and a.get("href"):
+    out: List[Dict] = []
+    seen: set[str] = set()
+
+    # DuckDuckGo HTML supports pagination via `s` (offset).
+    offset = 0
+    while len(out) < max_results and offset <= 120:
+        url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}&s={offset}"
+        html = await fetch_html(url, use_playwright_fallback=(USE_PLAYWRIGHT and BROWSER_FIRST))
+        if not html:
+            break
+        soup = BeautifulSoup(html, "html.parser")
+        results = soup.select(".result")
+        if not results:
+            break
+        added_this_page = 0
+        for el in results:
+            a = el.select_one(".result__a")
+            snip = el.select_one(".result__snippet")
+            href = a.get("href", "").strip() if a else ""
+            if not href or href in seen:
+                continue
+            seen.add(href)
             out.append({
-                "url":     a["href"],
-                "title":   a.get_text(strip=True),
+                "url": href,
+                "title": a.get_text(strip=True) if a else "",
                 "snippet": snip.get_text(strip=True) if snip else "",
             })
-    return out
+            added_this_page += 1
+            if len(out) >= max_results:
+                break
+        if added_this_page == 0:
+            break
+        offset += 30
+        await asyncio.sleep(0.15)
+
+    return out[:max_results]
 
 
 # ── Page classification ───────────────────────────────────────────────────────
@@ -399,6 +467,42 @@ def find_job_links(html: str, base_url: str) -> List[str]:
     return out[:30]
 
 
+def discover_career_urls(html: str, base_url: str) -> List[str]:
+    """
+    Discover likely careers/job links from any page (company home, about, etc.).
+    This expands crawl coverage beyond known job boards into career.<company>.com and /careers pages.
+    """
+    if not html:
+        return []
+    soup = BeautifulSoup(html[:250_000], "html.parser")
+    seen, out = set(), []
+
+    def add(u: str):
+        if not u:
+            return
+        full = urljoin(base_url, u.strip())
+        clean = full.split("#")[0].strip()
+        if not clean or clean in seen:
+            return
+        seen.add(clean)
+        out.append(clean)
+
+    kw = re.compile(r"\b(careers?|jobs?|openings?|positions?|vacancies?|join\s+us|work\s+with\s+us)\b", re.I)
+    for a in soup.find_all("a", href=True):
+        txt = (a.get_text(" ", strip=True) or "")[:80]
+        href = a.get("href", "")
+        if not href or href.startswith("mailto:") or href.startswith("javascript:"):
+            continue
+        if kw.search(txt) or kw.search(href):
+            add(href)
+
+    # Hard patterns (some sites hide text)
+    for a in soup.select("a[href*='careers'], a[href*='/jobs'], a[href*='/careers']"):
+        add(a.get("href", ""))
+
+    return out[:40]
+
+
 async def fetch_paginated_jobs(
     base_url: str,
     query: str,
@@ -413,6 +517,8 @@ async def fetch_paginated_jobs(
     all_jobs: List[Dict] = []
     seen_urls: set = set()
 
+    use_js = use_js or (USE_PLAYWRIGHT and BROWSER_FIRST)
+
     if "{page}" in base_url:
         # Template URL mode — increment page number
         for page_num in range(1, max_pages + 1):
@@ -425,8 +531,8 @@ async def fetch_paginated_jobs(
 
             html = None
             if use_js:
-                from playwright_pool import fetch_with_playwright
-                html = await fetch_with_playwright(url)
+                from browser_fetch import fetch_rendered
+                html = await fetch_rendered(url)
             if not html:
                 html = await fetch_html(url)
             if not html:
@@ -434,6 +540,22 @@ async def fetch_paginated_jobs(
 
             page_type = classify_page(html, url)
             jobs, _ = await _extract_from_html(html, url, page_type)
+            if not jobs and page_type in ("job_listing", "careers_home"):
+                # Fallback: follow discovered job links from listing pages.
+                links = find_job_links(html, url)[:10]
+                if links:
+                    detail_tasks = [
+                        fetch_html(l, use_playwright_fallback=use_js) for l in links
+                    ]
+                    detail_htmls = await asyncio.gather(*detail_tasks, return_exceptions=True)
+                    for lnk, dh in zip(links, detail_htmls):
+                        if isinstance(dh, Exception) or not dh:
+                            continue
+                        pt = classify_page(dh, lnk)
+                        if pt == "job_detail":
+                            j = extract_detail_job(dh, lnk)
+                            if j:
+                                jobs.append(j)
             if not jobs:
                 break  # Empty page = we've gone far enough
             all_jobs.extend(jobs)
@@ -450,8 +572,8 @@ async def fetch_paginated_jobs(
 
             html = None
             if use_js:
-                from playwright_pool import fetch_with_playwright
-                html = await fetch_with_playwright(url)
+                from browser_fetch import fetch_rendered
+                html = await fetch_rendered(url)
             if not html:
                 html = await fetch_html(url)
             if not html:
@@ -459,6 +581,21 @@ async def fetch_paginated_jobs(
 
             page_type = classify_page(html, url)
             jobs, _ = await _extract_from_html(html, url, page_type)
+            if not jobs and page_type in ("job_listing", "careers_home"):
+                links = find_job_links(html, url)[:10]
+                if links:
+                    detail_tasks = [
+                        fetch_html(l, use_playwright_fallback=use_js) for l in links
+                    ]
+                    detail_htmls = await asyncio.gather(*detail_tasks, return_exceptions=True)
+                    for lnk, dh in zip(links, detail_htmls):
+                        if isinstance(dh, Exception) or not dh:
+                            continue
+                        pt = classify_page(dh, lnk)
+                        if pt == "job_detail":
+                            j = extract_detail_job(dh, lnk)
+                            if j:
+                                jobs.append(j)
             all_jobs.extend(jobs)
 
             # Find next page link
@@ -508,7 +645,41 @@ def extract_skills(text: str) -> List[str]:
     if not text:
         return []
     low = text.lower()
-    return [s for s in TECH_SKILLS if re.search(r"\b" + re.escape(s) + r"\b", low)][:20]
+
+    # Normalize a few common aliases to improve recall.
+    low = low.replace("adf", "azure data factory")
+    low = low.replace("a.d.f", "azure data factory")
+    low = low.replace("synapse analytics", "synapse")
+
+    # Count occurrences and sort by frequency/first occurrence.
+    found: List[tuple[str, int, int]] = []
+    for s in TECH_SKILLS:
+        pat = r"\b" + re.escape(s.lower()) + r"\b"
+        matches = list(re.finditer(pat, low))
+        if not matches:
+            continue
+        count = len(matches)
+        first = matches[0].start()
+        found.append((s, count, first))
+
+    found.sort(key=lambda t: (-t[1], t[2], len(t[0])))
+    skills = [s for s, _, _ in found]
+
+    # Add a few high-signal resume terms not captured by TECH_SKILLS list.
+    extra_terms = [
+        ("ci/cd", r"\bci/?cd\b"),
+        ("etl", r"\betl\b"),
+        ("elt", r"\belt\b"),
+        ("medallion", r"\bmedallion\b"),
+        ("lakehouse", r"\blakehouse\b"),
+        ("data modeling", r"\bdata\s+model"),
+        ("star schema", r"\bstar\s+schema\b"),
+    ]
+    for label, pat in extra_terms:
+        if re.search(pat, low) and label not in skills:
+            skills.append(label)
+
+    return skills[:40]
 
 
 def infer_experience(text: str) -> str:
@@ -570,15 +741,37 @@ def _extract_date(soup: BeautifulSoup) -> str:
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
-async def extract_jobs_from_url(url: str) -> Tuple[List[Dict], str]:
-    """Fetch URL and extract all jobs from it. Returns (jobs, page_type)."""
-    html = await fetch_html(url)
+async def extract_jobs_from_url(url: str) -> Tuple[List[Dict], str, Dict]:
+    """Fetch URL and extract all jobs from it. Returns (jobs, page_type, fetch_meta)."""
+    domain = urlparse(url).netloc
+    use_rendered_fallback = bool((USE_PLAYWRIGHT or USE_SELENIUM) and (BROWSER_FIRST or domain in JS_HEAVY_DOMAINS))
+
+    fetch_meta: Dict = {"engine": "none", "rendered": False}
+    html = await fetch_html(url, use_playwright_fallback=False)
+    if html:
+        fetch_meta = {"engine": "httpx", "rendered": False}
+    elif use_rendered_fallback:
+        from browser_fetch import fetch_rendered_with_engine
+        html2, eng2 = await fetch_rendered_with_engine(url)
+        if html2:
+            html = html2
+            fetch_meta = {"engine": eng2, "rendered": True}
+
     if not html:
-        return [], "failed"
+        return [], "failed", fetch_meta
 
     page_type = classify_page(html, url)
     if page_type == "irrelevant":
-        return [], page_type
+        # Heuristic: for JS-heavy sites (or suspiciously empty pages), try a rendered fetch.
+        if use_rendered_fallback and not fetch_meta.get("rendered"):
+            from browser_fetch import fetch_rendered_with_engine
+            html2, eng2 = await fetch_rendered_with_engine(url)
+            if html2 and html2 != html:
+                html = html2
+                fetch_meta = {"engine": eng2, "rendered": True}
+                page_type = classify_page(html, url)
+        if page_type == "irrelevant":
+            return [], page_type, fetch_meta
 
     # JSON-LD is most reliable — always try first
     jobs = extract_jsonld_jobs(html, url)
@@ -591,7 +784,26 @@ async def extract_jobs_from_url(url: str) -> Tuple[List[Dict], str]:
             if j:
                 jobs = [j]
 
-    return jobs, page_type
+    # Heuristic Playwright fallback: if extraction fails and page looks "empty", try rendering once.
+    if not jobs and use_rendered_fallback and not fetch_meta.get("rendered"):
+        text_len = len(BeautifulSoup(html[:200_000], "html.parser").get_text(" ", strip=True))
+        if len(html) < 5000 or text_len < 600:
+            from browser_fetch import fetch_rendered_with_engine
+            html2, eng2 = await fetch_rendered_with_engine(url)
+            if html2 and html2 != html:
+                fetch_meta = {"engine": eng2, "rendered": True}
+                page_type = classify_page(html2, url)
+                if page_type != "irrelevant":
+                    jobs = extract_jsonld_jobs(html2, url)
+                    if not jobs:
+                        if page_type == "job_listing":
+                            jobs = extract_heuristic_jobs(html2, url)
+                        elif page_type == "job_detail":
+                            j = extract_detail_job(html2, url)
+                            if j:
+                                jobs = [j]
+
+    return jobs, page_type, fetch_meta
 
 
 # ── Free API fetchers ─────────────────────────────────────────────────────────

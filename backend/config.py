@@ -1,24 +1,41 @@
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 
-from dotenv import load_dotenv
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover
+    load_dotenv = None
 
-BASE_DIR   = Path(__file__).parent
+if load_dotenv:
+    load_dotenv()
+
+BASE_DIR   = Path(__file__).resolve().parent
+ROOT_DIR   = BASE_DIR.parent
 DATA_DIR   = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 RESUME_DIR = DATA_DIR / "resumes"
 RESUME_DIR.mkdir(exist_ok=True)
 
-DB_PATH = str(DATA_DIR / "jobsearch.db")
+DB_PATH = os.environ.get("JOBRADAR_DB_PATH", str(ROOT_DIR / "jobsearch.db"))
 
 # ── Search limits ─────────────────────────────────────────────────────────────
-MAX_QUERIES_PER_SESSION  = int(os.environ.get("MAX_QUERIES",   "40"))
-MAX_URLS_PER_QUERY       = int(os.environ.get("MAX_URLS",      "15"))
-MAX_PAGES_TOTAL          = int(os.environ.get("MAX_PAGES",     "8000"))
-MAX_JOBS_PER_SESSION     = int(os.environ.get("MAX_JOBS",      "3000"))
+MAX_QUERIES_PER_SESSION  = int(os.environ.get("MAX_QUERIES",   "200"))
+MAX_URLS_PER_QUERY       = int(os.environ.get("MAX_URLS",      "50"))
+MAX_PAGES_TOTAL          = int(os.environ.get("MAX_PAGES",     "50000"))
+MAX_JOBS_PER_SESSION     = int(os.environ.get("MAX_JOBS",      "5000"))
 MIN_QUALITY_JOBS         = int(os.environ.get("MIN_QUALITY",   "50"))
-MAX_CONCURRENT_FETCHES   = int(os.environ.get("MAX_CONCURRENT","40"))
+MAX_CONCURRENT_FETCHES   = int(os.environ.get("MAX_CONCURRENT","80"))
+MAX_WATCH_CYCLES         = int(os.environ.get("MAX_WATCH_CYCLES", "48"))
+WATCH_HEARTBEAT_SEC      = int(os.environ.get("WATCH_HEARTBEAT_SEC", "5"))
+SEARCH_EMPTY_WAVE_LIMIT  = int(os.environ.get("SEARCH_EMPTY_WAVE_LIMIT", "6"))
+
+# ── Meta-agent ───────────────────────────────────────────────────────────────
+META_AGENT              = os.environ.get("META_AGENT", "true").lower() == "true"
+META_AGENT_MAX_STEPS    = int(os.environ.get("META_AGENT_MAX_STEPS", "80"))
+
+# Crawl-first mode: disable free APIs by default
+USE_FREE_APIS            = os.environ.get("USE_FREE_APIS", "false").lower() == "true"
 
 # ── HTTP ──────────────────────────────────────────────────────────────────────
 REQUEST_TIMEOUT  = 18
@@ -27,14 +44,24 @@ CRAWL_DELAY      = 0.6   # seconds between requests to same domain
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
 # FIX: Was 0.10 — far too low. 10-20% irrelevant jobs were flooding results.
-# 0.35 means a job must have meaningful alignment to appear at all.
-MIN_SCORE_THRESHOLD    = 0.35
-HIGH_QUALITY_THRESHOLD = 0.65   # was 0.55
+# 0.80 means only strong matches are surfaced (user expectation: 80%+ relevance)
+MIN_SCORE_THRESHOLD    = float(os.environ.get("MIN_SCORE_THRESHOLD", "0.80"))
+HIGH_QUALITY_THRESHOLD = float(os.environ.get("HIGH_QUALITY_THRESHOLD", "0.90"))
 
 # ── Playwright ────────────────────────────────────────────────────────────────
 USE_PLAYWRIGHT         = os.environ.get("USE_PLAYWRIGHT", "true").lower() == "true"
 PLAYWRIGHT_POOL_SIZE   = int(os.environ.get("PLAYWRIGHT_POOL", "3"))
 PLAYWRIGHT_TIMEOUT     = 25_000   # ms
+
+# Browser-first crawling (selenium-style): attempt rendered fetch before plain HTTP.
+BROWSER_FIRST          = os.environ.get("BROWSER_FIRST", "true").lower() == "true"
+
+# ── Selenium (fallback) ──────────────────────────────────────────────────────
+USE_SELENIUM           = os.environ.get("USE_SELENIUM", "true").lower() == "true"
+SELENIUM_POOL_SIZE     = int(os.environ.get("SELENIUM_POOL", "1"))
+SELENIUM_TIMEOUT_MS    = int(os.environ.get("SELENIUM_TIMEOUT_MS", "25000"))
+SELENIUM_CHROME_BINARY = os.environ.get("SELENIUM_CHROME_BINARY", "")
+SELENIUM_DRIVER_PATH   = os.environ.get("SELENIUM_DRIVER_PATH", "")
 
 # ── ATS platform host fragments ───────────────────────────────────────────────
 ATS_DOMAINS = {
@@ -225,6 +252,13 @@ JOB_SITES: dict[str, dict] = {
 # ── Sites needing Playwright (JS-heavy) ───────────────────────────────────────
 JS_HEAVY_SITES = {k for k, v in JOB_SITES.items() if v.get("type") == "html_js"}
 
+# Domains for JS-heavy sites (used by generic pipeline heuristics)
+JS_HEAVY_DOMAINS = {
+    urlparse(v.get("url", "")).netloc
+    for k, v in JOB_SITES.items()
+    if k in JS_HEAVY_SITES and v.get("url")
+}
+
 # ── Free job API endpoints (no key required) ──────────────────────────────────
 FREE_JOB_APIS = {
     "remotive":  "https://remotive.com/api/remote-jobs?search={query}&limit=100",
@@ -318,8 +352,10 @@ INDIA_LOCATION_SIGNALS = [
 CORS_ORIGINS = [
     "http://localhost:4321",
     "http://localhost:3000",
+    "http://localhost:5173",
     "http://127.0.0.1:4321",
     "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
 ]
 
 # ── User agents ───────────────────────────────────────────────────────────────
@@ -338,3 +374,6 @@ ADZUNA_APP_KEY = os.environ.get("ADZUNA_APP_KEY", "")
 # ── OpenAI ────────────────────────────────────────────────────────────────────
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL   = os.environ.get("OPENAI_MODEL", "gpt-4.1")
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "")
+# For OpenAI-compatible gateways (e.g. Azure OpenAI /openai/v1) that expect `api-key`.
+OPENAI_API_KEY_HEADER = os.environ.get("OPENAI_API_KEY_HEADER", "")

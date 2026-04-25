@@ -1,4 +1,5 @@
 ---
+import "../styles/global.css";
 import AppShell from "../components/AppShell.svelte";
 ---
 <!DOCTYPE html>
@@ -12,39 +13,22 @@ import AppShell from "../components/AppShell.svelte";
     href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>◎</text></svg>" />
 </head>
 <body>
-  <!-- Top nav bar -->
-  <header style="
-    position: sticky; top: 0; z-index: 50;
-    background: rgba(13,14,16,0.85);
-    backdrop-filter: blur(12px);
-    border-bottom: 1px solid #2a2d36;
-    padding: 0 24px;
-    height: 52px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  ">
-    <div style="display:flex;align-items:center;gap:10px;">
-      <span style="font-size:18px;color:#f59e0b;">◎</span>
-      <span style="font-size:15px;font-weight:700;color:#f1f2f4;letter-spacing:0.02em;">JobRadar</span>
-      <span style="font-size:11px;color:#555b6e;font-family:'JetBrains Mono',monospace;margin-left:4px;">v2.0</span>
-    </div>
-    <div style="display:flex;align-items:center;gap:8px;">
-      {["60+ Sites","Deep Crawl","AI Ranked"].map(l => (
-        <span style="
-          font-family:'JetBrains Mono',monospace;
-          font-size:10px;
-          color:#8891a4;
-          border:1px solid #2a2d36;
-          border-radius:4px;
-          padding:2px 8px;
-          letter-spacing:0.05em;
-        ">{l}</span>
-      ))}
+  <header class="sticky top-0 z-50 border-b border-border bg-[#10141bcc] backdrop-blur-md">
+    <div class="mx-auto flex h-16 max-w-[1440px] items-center justify-between px-4 sm:px-6">
+      <div class="flex items-center gap-2.5">
+        <span class="text-lg text-text-lo">◎</span>
+        <span class="text-[15px] font-semibold tracking-[0.18em] text-text-hi uppercase">JobRadar</span>
+        <span class="ml-1 font-mono text-[11px] text-text-dim">v2.0</span>
+      </div>
+      <div class="hidden items-center gap-2 sm:flex">
+        {["60+ Sites","Deep Crawl","AI Ranked"].map(l => (
+          <span class="rounded-full border border-border px-3 py-1 font-mono text-[10px] tracking-wider text-text-lo">{l}</span>
+        ))}
+      </div>
     </div>
   </header>
 
-  <main style="max-width:1400px;margin:0 auto;padding:24px 20px;">
+  <main class="mx-auto max-w-[1440px] px-4 py-6 sm:px-6 sm:py-8">
     <AppShell client:load />
   </main>
 </body>

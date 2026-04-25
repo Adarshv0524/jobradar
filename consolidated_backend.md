@@ -274,40 +274,150 @@ async def _llm_call(
         return None, 0, 0
 
 
-async def _plan_queries(st: _State) -> Tuple[List[str], str]:
-    """Phase 1: LLM generates diverse search queries."""
-    skills = ", ".join(st.profile.get("skills", [])[:15]) or "not specified"
+def preprocess_query(raw_query: str, prefs: dict) -> dict:
+    """
+    Normalize a raw user query into structured search intent.
+
+    Returns dict with:
+        canonical_query   — cleaned, normalized query string
+        role_title        — inferred role title
+        exp_level         — inferred or overridden exp level
+        location_hints    — list of location terms to inject
+        extra_terms       — extra terms to append to queries
+
+    Examples:
+        "data engineer fresher" → level=junior, extra=["entry level", "fresher", "0-1 years"]
+        "junior python dev india" → role="python developer", location=["india", "bangalore"]
+    """
+    q   = raw_query.lower().strip()
+    loc = (prefs.get("location") or "").lower()
+
+    # ── Exp level hints from query text ──────────────────────────────────────
+    exp_from_prefs  = prefs.get("experience_level", "")
+    exp_from_query  = ""
+    fresher_signals = ["fresher", "fresh graduate", "new grad", "entry level",
+                       "entry-level", "0 experience", "0 years", "no experience"]
+    junior_signals  = ["junior", "jr.", "jr ", "beginner", "associate", "trainee"]
+    senior_signals  = ["senior", "sr.", "sr ", "lead", "staff", "principal"]
+
+    if any(s in q for s in fresher_signals):
+        exp_from_query = "junior"
+    elif any(s in q for s in junior_signals):
+        exp_from_query = "junior"
+    elif any(s in q for s in senior_signals):
+        exp_from_query = "senior"
+
+    effective_exp = exp_from_prefs or exp_from_query or ""
+
+    # ── Location hints ────────────────────────────────────────────────────────
+    india_signals = ["india", "bangalore", "bengaluru", "hyderabad", "pune",
+                     "mumbai", "chennai", "delhi", "ncr", "noida", "gurgaon"]
+    location_hints = []
+    if any(s in loc for s in india_signals) or any(s in q for s in india_signals):
+        location_hints = ["India", "Bangalore", "Hyderabad", "Pune", "remote India"]
+
+    # ── Extra query terms for experience level ────────────────────────────────
+    extra_terms = []
+    if effective_exp in ("junior", "intern"):
+        extra_terms = ["junior", "entry level", "fresher", "0-2 years", "new grad",
+                       "associate", "graduate trainee"]
+    elif effective_exp == "mid":
+        extra_terms = ["mid-level", "2-4 years", "intermediate"]
+    elif effective_exp in ("senior", "lead"):
+        extra_terms = ["senior", "5+ years", "lead", "staff"]
+
+    # ── Clean the canonical query (remove level/location words) ──────────────
+    stop = fresher_signals + junior_signals + senior_signals + india_signals + [
+        "remote", "hybrid", "onsite", "on-site", "job", "jobs", "hiring",
+        "position", "role", "opening",
+    ]
+    tokens = q.split()
+    cleaned = " ".join(t for t in tokens if t not in stop and len(t) > 2)
+    canonical = cleaned.strip() or raw_query.strip()
+
+    return {
+        "canonical_query": canonical,
+        "role_title":      canonical,
+        "exp_level":       effective_exp,
+        "location_hints":  location_hints,
+        "extra_terms":     extra_terms,
+    }
+
+
+async def _plan_queries(st: "_State") -> "Tuple[List[str], str]":
+    """Phase 1: LLM generates diverse search queries with location + exp awareness."""
+
+    parsed   = preprocess_query(st.query, st.prefs)
+    skills   = ", ".join(st.profile.get("skills", [])[:15]) or "not specified"
+    loc      = st.prefs.get("location") or "any"
+    exp      = parsed["exp_level"] or st.prefs.get("experience_level") or "not specified"
+    hints    = parsed["location_hints"]
+    extra    = parsed["extra_terms"]
+    role     = parsed["canonical_query"]
+
+    # Build location-specific instruction
+    if hints:
+        loc_instruction = (
+            f"Location is '{loc}'. MUST include queries targeting: {', '.join(hints[:3])}. "
+            "Do NOT generate queries for United States / Americas unless also pairing with 'remote worldwide'."
+        )
+    else:
+        loc_instruction = f"Location: {loc}."
+
+    # Build exp-level instruction
+    if exp in ("junior", "intern"):
+        exp_instruction = (
+            f"Experience level is '{exp}' (FRESHER / 0-2 years). "
+            "ALL queries must target entry-level / junior / fresher / new-grad roles ONLY. "
+            "NEVER include 'senior', 'lead', 'staff', 'principal', 'manager' in any query. "
+            f"Include terms like: {', '.join(extra[:5])}."
+        )
+    elif exp == "senior":
+        exp_instruction = (
+            f"Experience level is senior (5+ years). "
+            "Focus on senior / lead / staff engineer queries."
+        )
+    else:
+        exp_instruction = f"Experience level: {exp or 'not specified'}."
+
     system = (
-        "You are a world-class job search strategist. "
-        "Generate the most comprehensive set of queries to find REAL job postings — "
-        "not aggregator pages. Focus on ATS platforms and company career pages."
+        "You are a world-class job search strategist with deep knowledge of "
+        "tech job markets globally, especially India and remote-first companies. "
+        "Generate targeted queries to find REAL job postings — not aggregator pages. "
+        "Focus on ATS platforms and company career pages."
     )
-    user = f"""Target: {st.query}
+    user = f"""Target role: {role}
+Original query: {st.query}
 Skills: {skills}
-Location: {st.prefs.get('location') or 'any'}
-Remote: {st.prefs.get('remote_preference') or 'any'}
-Level: {st.prefs.get('experience_level') or 'not specified'}
+{loc_instruction}
+Remote preference: {st.prefs.get('remote_preference') or 'any'}
+{exp_instruction}
 Summary: {(st.profile.get('summary') or '')[:300]}
 
 Generate 15-20 diverse queries. MUST include:
 - 5+ ATS-specific (site:greenhouse.io, site:lever.co, site:ashbyhq.com, site:boards.greenhouse.io, site:jobs.lever.co)
 - Role title variations (e.g. 'data engineer', 'data pipeline engineer', 'ETL engineer')
-- Skill-combo queries
-- Company-type variants (startup, FAANG, fintech, etc.)
-- Remote/location variants
+- Skill-combo queries (combine role + top skills from profile)
+- Location variants: {', '.join(hints) if hints else 'worldwide / remote'}
+- Experience-level terms: {', '.join(extra[:4]) if extra else 'any level'}
+- Company-type variants (startup, product company, MNC, FAANG)
+
+IMPORTANT: If location is India, include at least 3 India-specific queries.
+If level is junior/fresher, every single query must use junior/entry-level language.
 """
     result, p, c = await _llm_call(
-        messages=[{"role":"system","content":system},{"role":"user","content":user}],
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         tools=[_TOOLS[0]],
-        tool_choice={"type":"function","function":{"name":"generate_search_queries"}},
-        max_tokens=1400,
+        tool_choice={"type": "function", "function": {"name": "generate_search_queries"}},
+        max_tokens=1600,
         state=st,
     )
     if result and "queries" in result:
         all_q = result.get("queries", []) + result.get("ats_specific", [])
         qs    = [q.strip() for q in all_q if q.strip()]
         return qs[:MAX_QUERIES_PER_SESSION], result.get("reasoning", "")
-    return _heuristic_queries(st.query, st.prefs), "heuristic fallback"
+
+    return _smart_heuristic_queries(st.query, st.prefs, parsed), "heuristic fallback"
 
 
 async def _pick_urls(results: List[dict], st: _State) -> Tuple[List[str], str]:
@@ -408,24 +518,52 @@ async def _infer_salary(job: dict, st: _State) -> Optional[str]:
 
 # ── Heuristic fallback (no LLM) ───────────────────────────────────────────────
 
-def _heuristic_queries(query: str, prefs: dict) -> List[str]:
-    base = query.strip()
-    loc  = prefs.get("location", "")
-    qs   = [
-        base,
-        f"{base} remote",
+def _smart_heuristic_queries(query: str, prefs: dict, parsed: dict) -> "List[str]":
+    """
+    Improved heuristic fallback that injects location and exp level terms.
+    Replaces the old _heuristic_queries().
+    """
+    base   = parsed["canonical_query"] or query.strip()
+    loc    = prefs.get("location", "")
+    exp    = parsed["exp_level"] or prefs.get("experience_level", "")
+    hints  = parsed["location_hints"]
+    extras = parsed["extra_terms"][:3]
+
+    qs = []
+
+    # Base + exp modifier
+    for e in (extras or [base]):
+        qs.append(f"{base} {e}")
+
+    # ATS queries — always include
+    qs += [
         f"{base} site:boards.greenhouse.io",
         f"{base} site:jobs.lever.co",
         f"{base} site:ashbyhq.com",
-        f"{base} site:workday.com",
-        f"{base} site:careers.google.com",
-        f"{base} \"we are hiring\"",
-        f"{base} engineer jobs",
-        f"{base} developer hiring 2024",
+        f"{base} site:myworkdayjobs.com",
+        f"{base} site:careers.icims.com",
     ]
-    if loc:
-        qs.insert(2, f"{base} {loc}")
-    return qs[:MAX_QUERIES_PER_SESSION]
+
+    # Location-specific
+    for h in hints[:3]:
+        qs.append(f"{base} {h}")
+        if extras:
+            qs.append(f"{base} {extras[0]} {h}")
+
+    # Generic fallback
+    qs += [
+        f"{base} remote",
+        f"{base} job openings",
+        f"{base} hiring 2025",
+    ]
+
+    # Deduplicate and cap
+    seen, out = set(), []
+    for q in qs:
+        if q not in seen:
+            seen.add(q)
+            out.append(q)
+    return out[:MAX_QUERIES_PER_SESSION]
 
 
 # ── Concurrent page fetcher ────────────────────────────────────────────────────
@@ -493,11 +631,20 @@ async def _fetch_single(url: str, st: _State) -> List[dict]:
 # ── Job processing ────────────────────────────────────────────────────────────
 
 async def _process_raw_jobs(
-    raw_jobs: List[dict],
-    st: _State,
+    raw_jobs: "List[dict]",
+    st: "_State",
     infer_missing_salary: bool = False,
-) -> AsyncGenerator[dict, None]:
-    """Score, dedup, store jobs and yield them."""
+) -> "AsyncGenerator[dict, None]":
+    """Score, dedup, store jobs and yield them.
+    
+    FIX: Added pre-scoring filters:
+    1. Garbage / HN opinion post filter
+    2. Hard experience-level mismatch filter (avoids wasting LLM tokens on irrelevant jobs)
+    """
+    from ranker import _exp_rank, _is_garbage_title
+
+    pref_exp = (st.prefs.get("experience_level") or "").lower()
+
     for raw in raw_jobs:
         if len(st.jobs) >= MAX_JOBS_PER_SESSION:
             return
@@ -506,24 +653,50 @@ async def _process_raw_jobs(
         if apply_url and apply_url in st.apply_urls:
             continue
 
-        fake, _ = is_fake_job(raw.get("title", ""), raw.get("description", ""))
-        if fake:
+        # ── FIX: Garbage title filter ────────────────────────────────────────
+        title = raw.get("title", "")
+        if _is_garbage_title(title):
             continue
 
-        # Skip clearly bad titles from aggregator pages
-        title = raw.get("title", "")
+        # ── FIX: HN opinion-post filter ──────────────────────────────────────
+        # HN posts that are opinions/discussions have no apply_url AND
+        # the "title" is actually the comment text (very long)
+        if not apply_url and len(title) > 80:
+            continue
+
+        # ── FIX: Aggregator noise filter ─────────────────────────────────────
         if any(pat in title.lower() for pat in [
             "jobs in ", "+jobs", "k jobs", "job openings",
             "careers at indeed", "jobs near", "hiring now",
+            "✓ we", "&#x",
         ]):
             continue
+
+        fake, _ = is_fake_job(title, raw.get("description", ""))
+        if fake:
+            continue
+
+        # ── FIX: Hard exp-level pre-filter ───────────────────────────────────
+        # Skip senior/lead/staff jobs entirely when user wants junior/fresher.
+        # This avoids scoring (and storing) thousands of irrelevant senior jobs.
+        if pref_exp in ("junior", "intern", "fresher", "entry"):
+            job_exp = (raw.get("experience_level") or "").lower()
+            if job_exp in ("senior", "lead", "staff", "principal", "director"):
+                continue
+            # Also check title keywords
+            title_low = title.lower()
+            if any(k in title_low for k in [
+                "senior", "sr.", " sr ", "lead ", "staff ", "principal",
+                "head of", "director", "vp of", "manager",
+            ]):
+                continue
 
         # Infer missing salary via LLM (only for high-potential jobs)
         if infer_missing_salary and not raw.get("salary"):
             inferred = await _infer_salary(raw, st)
             if inferred:
-                raw["salary"]           = inferred
-                raw["salary_inferred"]  = True
+                raw["salary"]          = inferred
+                raw["salary_inferred"] = True
 
         scored = score_job(raw, st.profile, st.prefs, st.feedback)
         if scored.get("score", 0) < MIN_SCORE_THRESHOLD:
@@ -955,8 +1128,10 @@ MAX_RETRIES      = 3
 CRAWL_DELAY      = 0.6   # seconds between requests to same domain
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
-MIN_SCORE_THRESHOLD    = 0.10
-HIGH_QUALITY_THRESHOLD = 0.55
+# FIX: Was 0.10 — far too low. 10-20% irrelevant jobs were flooding results.
+# 0.35 means a job must have meaningful alignment to appear at all.
+MIN_SCORE_THRESHOLD    = 0.35
+HIGH_QUALITY_THRESHOLD = 0.65   # was 0.55
 
 # ── Playwright ────────────────────────────────────────────────────────────────
 USE_PLAYWRIGHT         = os.environ.get("USE_PLAYWRIGHT", "true").lower() == "true"
@@ -1082,150 +1257,15 @@ JOB_SITES: dict[str, dict] = {
         "url": "https://builtin.com/jobs/remote?search={query}&page={page}",
         "type": "html_js", "max_pages": 20,
     },
-    "builtin_nyc":   {
-        "label": "Built In NYC",
-        "url": "https://www.builtinnyc.com/jobs?search={query}&page={page}",
-        "type": "html_js", "max_pages": 10,
-    },
-    "builtin_sf":    {
-        "label": "Built In SF",
-        "url": "https://www.builtinsf.com/jobs?search={query}&page={page}",
-        "type": "html_js", "max_pages": 10,
-    },
     "remote_co":     {
         "label": "Remote.co",
         "url": "https://remote.co/remote-jobs/search/?search_keywords={query}&page={page}",
         "type": "html", "max_pages": 10,
     },
-    "remoteLeaf":    {
-        "label": "RemoteLeaf",
-        "url": "https://remoteleaf.com/jobs?search={query}",
-        "type": "html", "max_pages": 5,
-    },
-    "working_nomads": {
-        "label": "Working Nomads",
-        "url": "https://www.workingnomads.com/jobs?category={query}&page={page}",
-        "type": "html", "max_pages": 10,
-    },
-    "just_remote":   {
-        "label": "JustRemote",
-        "url": "https://justremote.co/remote-jobs?search={query}&p={page}",
-        "type": "html", "max_pages": 10,
-    },
-    "authentic_jobs": {
-        "label": "Authentic Jobs",
-        "url": "https://authenticjobs.com/?search={query}&page={page}",
-        "type": "html", "max_pages": 10,
-    },
-    "jobspresso":    {
-        "label": "Jobspresso",
-        "url": "https://jobspresso.co/remote-work/?s={query}&paged={page}",
-        "type": "html", "max_pages": 5,
-    },
-    "flexjobs":      {
-        "label": "FlexJobs",
-        "url": "https://www.flexjobs.com/telecommuting-jobs/kw-{query}?page={page}",
-        "type": "html", "max_pages": 15,
-    },
-    "dice":          {
-        "label": "Dice",
-        "url": "https://www.dice.com/jobs?q={query}&page={page}",
-        "type": "html_js", "max_pages": 20,
-    },
-    "hired":         {
-        "label": "Hired",
-        "url": "https://hired.com/jobs#!?q={query}&page={page}",
-        "type": "html_js", "max_pages": 10,
-    },
-    "arc_dev":       {
-        "label": "Arc.dev",
-        "url": "https://arc.dev/remote-jobs/{query}?page={page}",
-        "type": "html_js", "max_pages": 10,
-    },
-    "contra":        {
-        "label": "Contra",
-        "url": "https://contra.com/opportunities?q={query}&page={page}",
-        "type": "html_js", "max_pages": 10,
-    },
-    "braintrust":    {
-        "label": "Braintrust",
-        "url": "https://app.usebraintrust.com/jobs/?search={query}&page={page}",
-        "type": "html_js", "max_pages": 10,
-    },
-    "gun_io":        {
-        "label": "Gun.io",
-        "url": "https://gun.io/find-work/jobs?q={query}",
-        "type": "html_js", "max_pages": 5,
-    },
-    "toptal":        {
-        "label": "Toptal",
-        "url": "https://www.toptal.com/jobs/search?query={query}",
-        "type": "html_js", "max_pages": 5,
-    },
-    "cord":          {
-        "label": "Cord",
-        "url": "https://cord.co/jobs?query={query}&page={page}",
-        "type": "html_js", "max_pages": 10,
-    },
-    "lemon_io":      {
-        "label": "Lemon.io",
-        "url": "https://lemon.io/jobs/?query={query}",
-        "type": "html", "max_pages": 5,
-    },
-    "underdog":      {
-        "label": "Underdog.io",
-        "url": "https://underdog.io/jobs?query={query}&page={page}",
-        "type": "html_js", "max_pages": 5,
-    },
-    "pallet":        {
-        "label": "Pallet",
-        "url": "https://pallet.xyz/explore/jobs?q={query}&page={page}",
-        "type": "html_js", "max_pages": 5,
-    },
-    "crunchboard":   {
-        "label": "CrunchBoard",
-        "url": "https://www.crunchboard.com/jobs?q={query}&page={page}",
-        "type": "html", "max_pages": 10,
-    },
-    "joblist":       {
-        "label": "JobList",
-        "url": "https://joblist.app/search?q={query}&page={page}",
-        "type": "html_js", "max_pages": 10,
-    },
-    "proxify":       {
-        "label": "Proxify",
-        "url": "https://proxify.io/jobs?search={query}&page={page}",
-        "type": "html", "max_pages": 5,
-    },
     "hn_whoishiring": {
         "label": "HN: Who's Hiring",
         "url": "https://hn.algolia.com/api/v1/search?query={query}+hiring&tags=comment",
         "type": "hn_api", "max_pages": 3,
-    },
-    "stackoverflow": {
-        "label": "Stack Overflow Jobs",
-        "url": "https://stackoverflow.com/jobs?q={query}&pg={page}",
-        "type": "html", "max_pages": 20,
-    },
-    "eurotechjobs":  {
-        "label": "EuroTech Jobs",
-        "url": "https://www.eurotechjobs.com/search/?q={query}&page={page}",
-        "type": "html", "max_pages": 10,
-    },
-    "honeypot":      {
-        "label": "Honeypot",
-        "url": "https://app.honeypot.io/search?q={query}&page={page}",
-        "type": "html_js", "max_pages": 10,
-    },
-    "cwjobs":        {
-        "label": "CW Jobs (UK)",
-        "url": "https://www.cwjobs.co.uk/jobs/{query}/in-remote?page={page}",
-        "type": "html", "max_pages": 10,
-    },
-    "jobserve":      {
-        "label": "JobServe",
-        "url": "https://www.jobserve.com/gb/en/Job-Search/?query={query}&page={page}",
-        "type": "html", "max_pages": 10,
     },
     "instahyre":     {
         "label": "Instahyre (India)",
@@ -1237,29 +1277,49 @@ JOB_SITES: dict[str, dict] = {
         "url": "https://www.iimjobs.com/j/{query}.html?page={page}",
         "type": "html", "max_pages": 10,
     },
+    "freshersworld": {
+        "label": "FreshersWorld (India)",
+        "url": "https://www.freshersworld.com/jobs/jobsearch/{query}?page={page}",
+        "type": "html", "max_pages": 5,
+    },
+    "naukri_it": {
+        "label": "Naukri IT (India – direct)",
+        "url": "https://www.naukri.com/{query}-jobs?jobAge=1",
+        "type": "html_js", "max_pages": 5,
+    },
+    "hirist":        {
+        "label": "Hirist (India Tech)",
+        "url": "https://www.hirist.tech/search?q={query}&page={page}",
+        "type": "html", "max_pages": 5,
+    },
+    "internshala":   {
+        "label": "Internshala (India)",
+        "url": "https://internshala.com/jobs/{query}/?page={page}",
+        "type": "html_js", "max_pages": 5,
+    },
+    "cutshort":      {
+        "label": "Cutshort (India)",
+        "url": "https://cutshort.io/jobs/{query}?page={page}",
+        "type": "html_js", "max_pages": 5,
+    },
+    "crunchboard":   {
+        "label": "CrunchBoard",
+        "url": "https://www.crunchboard.com/jobs?q={query}&page={page}",
+        "type": "html", "max_pages": 10,
+    },
+    "eurotechjobs":  {
+        "label": "EuroTech Jobs",
+        "url": "https://www.eurotechjobs.com/search/?q={query}&page={page}",
+        "type": "html", "max_pages": 10,
+    },
     "nodesk":        {
         "label": "NoDesk",
         "url": "https://nodesk.co/remote-jobs/{query}/?page={page}",
         "type": "html", "max_pages": 5,
     },
-    "remotehub":     {
-        "label": "RemoteHub",
-        "url": "https://remotehub.io/remote-jobs?query={query}&page={page}",
-        "type": "html_js", "max_pages": 10,
-    },
     "jobgether":     {
         "label": "Jobgether",
         "url": "https://jobgether.com/offer?search={query}&page={page}",
-        "type": "html", "max_pages": 10,
-    },
-    "remoteco":      {
-        "label": "Remote.co",
-        "url": "https://remote.co/remote-jobs/search/?search_keywords={query}",
-        "type": "html", "max_pages": 10,
-    },
-    "career_vault":  {
-        "label": "CareerVault",
-        "url": "https://careervault.io/remote/{query}?page={page}",
         "type": "html", "max_pages": 10,
     },
 }
@@ -1279,15 +1339,6 @@ FREE_JOB_APIS = {
     "devitjobs": "https://devitjobs.us/api/jobsLight",
 }
 
-# ── Open job board HTML templates ─────────────────────────────────────────────
-OPEN_JOB_BOARDS = [
-    "https://remotive.com/remote-jobs/search?search={query}&page={page}",
-    "https://weworkremotely.com/remote-jobs/search?term={query}&page={page}",
-    "https://startup.jobs/?q={query}&page={page}",
-    "https://www.ycombinator.com/jobs?q={query}",
-    "https://jobs.ashbyhq.com/search?query={query}",
-]
-
 # ── Known aggregator domains to skip ─────────────────────────────────────────
 AGGREGATOR_DOMAINS = {
     "indeed.com", "linkedin.com", "glassdoor.com", "naukri.com",
@@ -1304,24 +1355,65 @@ FAKE_SIGNALS = [
     "passive income", "no experience needed but", "make money online",
 ]
 
-# ── Canonical skill list ──────────────────────────────────────────────────────
+# ── Canonical skill list (EXPANDED with big-data, India-relevant tools) ───────
 TECH_SKILLS = [
+    # Languages
     "python", "javascript", "typescript", "java", "go", "golang", "rust",
     "c++", "c#", "ruby", "scala", "kotlin", "swift", "php",
+    # Frontend
     "react", "vue", "angular", "svelte", "nextjs", "nuxt",
+    # Backend frameworks
     "fastapi", "django", "flask", "spring", "rails", "laravel",
     "nodejs", "express", "graphql", "rest", "grpc",
+    # DevOps / infra
     "docker", "kubernetes", "k8s", "terraform", "ansible",
     "aws", "gcp", "azure", "cloud", "lambda", "s3",
+    # Databases
     "postgresql", "mysql", "sqlite", "mongodb", "redis",
-    "elasticsearch", "kafka", "spark", "airflow", "dbt",
-    "pytorch", "tensorflow", "sklearn", "pandas", "numpy",
+    "elasticsearch", "cassandra", "dynamodb", "hbase",
+    # ── Big Data & Data Engineering (FIXED: was missing many) ────────────────
+    "kafka", "spark", "apache spark", "pyspark",          # Streaming / compute
+    "airflow", "prefect", "dagster", "luigi",              # Orchestration
+    "dbt", "dbt core",                                     # Transformation
+    "databricks", "delta lake", "iceberg", "hudi",         # Lakehouse
+    "snowflake", "bigquery", "redshift", "synapse",        # Cloud DW
+    "hadoop", "hive", "presto", "trino", "impala",         # Hadoop ecosystem
+    "flink", "storm",                                      # Stream processing
+    "aws glue", "azure data factory", "gcp dataflow",      # ETL services
+    "nifi", "talend", "informatica",                       # ETL tools
+    "great expectations", "deequ",                         # Data quality
+    "data catalog", "apache atlas", "collibra",            # Governance
+    # ML / AI
+    "pytorch", "tensorflow", "sklearn", "pandas", "numpy", "polars",
     "llm", "machine learning", "deep learning", "nlp", "computer vision",
+    "mlflow", "mlops", "feature store", "kubeflow",
+    # BI / Analytics
+    "power bi", "tableau", "looker", "metabase", "superset",
+    "excel", "google sheets",
+    # General tech
     "sql", "nosql", "microservices", "devops", "sre", "ci/cd", "git",
-    "linux", "bash", "data engineering", "data science", "mlops",
-    "flink", "databricks", "snowflake", "bigquery", "redshift",
+    "linux", "bash", "data engineering", "data science",
     "celery", "rabbitmq", "protobuf", "openapi",
     "react native", "flutter", "ios", "android",
+]
+
+# ── US-only location signals (used in ranker to penalise for India searches) ──
+US_ONLY_LOCATION_SIGNALS = [
+    "united states", "usa only", "u.s. only", "us only",
+    "must be located in the us", "must reside in the us",
+    "remote us", "remote - us", "remote (us", "remote us only",
+    "north america only", "americas only", "us citizens only",
+    # US states / cities that make it unambiguously US
+    "new york", "san francisco", "los angeles", "seattle", "boston",
+    "chicago", "austin", "atlanta", "denver", "portland", "miami",
+    ", ca", ", ny", ", wa", ", tx", ", ma",   # state abbreviations in location
+]
+
+# ── India location signals (to boost for India searches) ─────────────────────
+INDIA_LOCATION_SIGNALS = [
+    "india", "bangalore", "bengaluru", "hyderabad", "pune", "mumbai",
+    "chennai", "delhi", "ncr", "noida", "gurgaon", "gurugram",
+    "kolkata", "ahmedabad", "jaipur", "kochi", "remote india",
 ]
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
@@ -1726,14 +1818,32 @@ async def close_playwright_pool() -> None:
 ## `ranker.py`
 
 ```python
-"""Multi-signal job scoring, ranking, and feedback-adaptive re-ranking."""
+"""
+Multi-signal job scoring, ranking, and feedback-adaptive re-ranking.
+
+KEY FIXES vs original:
+  1. Experience level mismatch now applies a hard MULTIPLIER (not just additive).
+     A fresher searching for junior roles will see senior/lead jobs score < 0.15
+     even if skills match — they will be filtered by MIN_SCORE_THRESHOLD.
+  2. Location penalty: "Remote United States" jobs are penalised when user
+     specifies a non-US location (e.g. India). US state/city signals in the
+     job location field are detected and scored accordingly.
+  3. Skill scoring weight increased (0.25→0.30) to reward tech-skill overlap more.
+  4. 'lead' and 'staff' and 'principal' are now recognised as exp rank 5,
+     above 'senior' (rank 4), so the diff calculation is more accurate.
+"""
 
 import math
 import re
 from datetime import datetime, date
 from typing import Dict, List
 
-from config import HIGH_QUALITY_THRESHOLD, MIN_SCORE_THRESHOLD
+from config import (
+    HIGH_QUALITY_THRESHOLD,
+    MIN_SCORE_THRESHOLD,
+    US_ONLY_LOCATION_SIGNALS,
+    INDIA_LOCATION_SIGNALS,
+)
 
 # Optional: sentence-transformers for semantic similarity
 _st_model = None
@@ -1815,41 +1925,128 @@ def recency_score(posted_date: str) -> float:
         return 0.5
 
 
+# ── Experience level ──────────────────────────────────────────────────────────
+
+def _exp_rank(lvl: str) -> int:
+    """
+    Numeric rank for experience levels.
+    FIX: Added 'lead', 'staff', 'principal' at rank 5 (above senior=4).
+    This makes junior→lead diff = 4 instead of 3, giving a heavier penalty.
+    """
+    return {
+        "intern":     0,
+        "fresher":    0,
+        "entry":      0,
+        "junior":     1,
+        "mid":        2,
+        "mid-senior": 3,
+        "senior":     4,
+        "lead":       5,
+        "staff":      5,
+        "principal":  5,
+        "director":   6,
+        "vp":         6,
+    }.get(lvl.lower().strip(), 2)
+
+
+def _exp_multiplier(pref_exp: str, job_exp: str) -> float:
+    """
+    FIX: Hard multiplier based on exp level diff.
+    Original code only did additive ±0.5 which was too weak.
+    Now a senior job for a junior searcher scores ×0.25 → near zero.
+    """
+    if not pref_exp or not job_exp:
+        return 1.0
+    diff = abs(_exp_rank(pref_exp) - _exp_rank(job_exp))
+    return {
+        0: 1.00,   # Perfect match
+        1: 0.85,   # One level off (junior vs mid = acceptable)
+        2: 0.55,   # Two levels (junior vs senior = borderline)
+        3: 0.25,   # Three levels (junior vs lead)
+        4: 0.10,   # Four levels (intern vs principal)
+    }.get(diff, 0.05)   # 5+ levels: near-zero
+
+
+# ── Location scoring ──────────────────────────────────────────────────────────
+
+def _location_multiplier(pref_loc: str, job: dict) -> float:
+    """
+    FIX: Detect 'Remote United States only' jobs and penalise them when
+    the user wants India (or any other non-US location).
+
+    Logic:
+    - If the job location or description contains strong US-only signals
+      AND the user wants India → heavy penalty (0.15)
+    - If the job is in India or worldwide/remote with no US restriction → bonus (1.1)
+    - Otherwise neutral (1.0)
+    """
+    if not pref_loc:
+        return 1.0
+
+    pref_lower    = pref_loc.lower()
+    job_loc       = (job.get("location") or "").lower()
+    job_desc      = (job.get("description") or "")[:500].lower()
+    job_remote    = (job.get("remote_type") or "").lower()
+
+    wants_india = any(s in pref_lower for s in [
+        "india", "bangalore", "bengaluru", "hyderabad", "pune", "mumbai",
+        "chennai", "delhi", "remote india",
+    ])
+
+    if wants_india:
+        # Check for hard US-only signals in location
+        us_in_loc  = any(s in job_loc  for s in US_ONLY_LOCATION_SIGNALS)
+        us_in_desc = any(s in job_desc for s in [
+            "authorized to work in the us", "must be in the us",
+            "remote - united states", "remote us only", "us-based only",
+            "must reside in the united states", "work authorization in the us",
+        ])
+        if us_in_loc or us_in_desc:
+            return 0.15  # Hard penalty — Indian candidates can't apply
+
+        # Reward India-specific jobs
+        india_in_loc = any(s in job_loc for s in INDIA_LOCATION_SIGNALS)
+        if india_in_loc:
+            return 1.15  # Bonus for India-specific roles
+
+        # Worldwide / no restriction remote — acceptable
+        if job_remote == "remote" and not us_in_loc:
+            return 0.90  # Slight discount (may still be US-only)
+
+        return 1.0
+
+    # For non-India preferences, do a simple containment check
+    pref_words = [w for w in pref_lower.split() if len(w) > 2]
+    if pref_words and job_loc:
+        if any(w in job_loc for w in pref_words):
+            return 1.10
+        if job_remote == "remote":
+            return 0.85
+        return 0.70   # Wrong location, not remote
+
+    return 1.0
+
+
 # ── Preference matching ───────────────────────────────────────────────────────
 
 def preference_score(job: dict, prefs: dict) -> float:
+    """
+    Additive preference score [0,1] based on remote type and salary.
+    NOTE: Experience level and location are now handled as multipliers
+    in score_job() rather than here, so they have stronger effect.
+    """
     score  = 0.0
     weight = 0
 
     # Remote preference
     pref_remote = prefs.get("remote_preference", "")
     job_remote  = (job.get("remote_type") or "").lower()
-    if pref_remote:
+    if pref_remote and pref_remote != "any":
         weight += 1
         if pref_remote == "remote"   and job_remote == "remote":   score += 1.0
         elif pref_remote == "hybrid" and job_remote in ("remote", "hybrid"): score += 0.8
         elif pref_remote == "on-site" and job_remote == "on-site": score += 1.0
-        elif job_remote == "remote":                                score += 0.6
-
-    # Location
-    pref_loc = (prefs.get("location") or "").lower()
-    job_loc  = (job.get("location")   or "").lower()
-    if pref_loc and job_loc:
-        weight += 1
-        if pref_loc in job_loc or job_loc in pref_loc:
-            score += 1.0
-        elif job_remote == "remote":
-            score += 0.7
-
-    # Experience level
-    pref_exp = (prefs.get("experience_level") or "").lower()
-    job_exp  = (job.get("experience_level")   or "").lower()
-    if pref_exp and job_exp:
-        weight += 1
-        if pref_exp == job_exp:
-            score += 1.0
-        elif abs(_exp_rank(pref_exp) - _exp_rank(job_exp)) == 1:
-            score += 0.5
+        elif job_remote == "remote":                                score += 0.4
 
     # Salary
     pref_sal  = prefs.get("min_salary", 0)
@@ -1861,12 +2058,8 @@ def preference_score(job: dict, prefs: dict) -> float:
     return score / weight if weight else 0.6  # neutral if no prefs set
 
 
-def _exp_rank(lvl: str) -> int:
-    return {"intern": 0, "junior": 1, "mid": 2, "mid-senior": 3, "senior": 4}.get(lvl, 2)
-
-
 def _extract_salary_number(salary_str: str) -> int:
-    nums = re.findall(r"[\d,]+", salary_str.replace("k", "000").replace("K", "000"))
+    nums = re.findall(r"[\d,]+", (salary_str or "").replace("k", "000").replace("K", "000"))
     if nums:
         try:
             return int(nums[0].replace(",", ""))
@@ -1898,6 +2091,33 @@ def check_negatives(job: dict, negatives: List[str]) -> List[str]:
     return flags
 
 
+# ── Title quality check ───────────────────────────────────────────────────────
+
+def _is_garbage_title(title: str) -> bool:
+    """
+    FIX: Detect HN opinion posts and aggregator noise that pass is_fake_job().
+    These have no real company or apply_url and look like opinion sentences.
+    """
+    if not title:
+        return True
+    low = title.lower()
+    # HN opinion comments often start with these patterns
+    garbage_signals = [
+        "there is no issue", "there is always", "lol @", "i've worked",
+        "i am not saying", "hey -", "ooh, let me", "as an aside",
+        "the issue is more", "frankly the issue",
+    ]
+    if any(s in low for s in garbage_signals):
+        return True
+    # Titles that are clearly sentences (contain a period mid-text or are very long)
+    if len(title) > 120:
+        return True
+    # Contains HTML entities
+    if "&amp;" in title or "&#x" in title or "href=" in title:
+        return True
+    return False
+
+
 # ── Main scoring ──────────────────────────────────────────────────────────────
 
 def score_job(job: dict, profile: dict, prefs: dict,
@@ -1905,10 +2125,32 @@ def score_job(job: dict, profile: dict, prefs: dict,
     """
     Returns updated job dict with 'score', 'score_breakdown',
     'match_reasons', 'reject_reasons'.
+
+    Score formula (before multipliers):
+      0.25 * semantic   — profile ↔ job description similarity
+      0.30 * skill_sc   — skill overlap (INCREASED from 0.25)
+      0.20 * title_sc   — role title match
+      0.15 * pref_sc    — remote / salary preferences
+      0.10 * rec_sc     — recency
+      + src_bonus       — ATS/structured source quality
+
+    Post-formula multipliers (applied last, can dramatically lower score):
+      × exp_mult        — experience level mismatch
+      × loc_mult        — US-only job for India searcher
     """
     title       = job.get("title", "")
     desc        = job.get("description", "")
     job_skills  = job.get("skills", [])
+
+    # ── Garbage filter ────────────────────────────────────────────────────────
+    if _is_garbage_title(title):
+        return {
+            **job,
+            "score": 0.0,
+            "score_breakdown": {},
+            "match_reasons": [],
+            "reject_reasons": ["Garbage/spam title detected"],
+        }
 
     profile_text    = _build_profile_text(profile)
     user_skills     = profile.get("skills", [])
@@ -1916,14 +2158,14 @@ def score_job(job: dict, profile: dict, prefs: dict,
     # 1. Semantic similarity between profile and job
     semantic = text_similarity(profile_text, title + " " + desc)
 
-    # 2. Skill overlap
+    # 2. Skill overlap (weight: 0.30, was 0.25)
     skill_sc = skill_overlap(user_skills, job_skills)
 
     # 3. Title match
     pref_role  = prefs.get("role", "")
     title_sc   = text_similarity(pref_role, title) if pref_role else semantic * 0.8
 
-    # 4. Preference match
+    # 4. Preference match (remote + salary only)
     pref_sc = preference_score(job, prefs)
 
     # 5. Recency
@@ -1949,28 +2191,47 @@ def score_job(job: dict, profile: dict, prefs: dict,
         if company in feedback_profile.get("negative_companies", set()):
             fb_adj -= 0.15
 
-    # Weighted composite
-    score = (
-        0.30 * semantic
-        + 0.25 * skill_sc
+    # ── Weighted composite (pre-multiplier) ───────────────────────────────────
+    raw_score = (
+        0.25 * semantic
+        + 0.30 * skill_sc          # INCREASED from 0.25
         + 0.20 * title_sc
         + 0.15 * pref_sc
         + 0.10 * rec_sc
         + src_bonus
         + fb_adj
     )
+    raw_score = max(0.0, min(1.0, raw_score))
+
+    # ── Apply hard multipliers ─────────────────────────────────────────────────
+    pref_exp  = (prefs.get("experience_level") or "").lower()
+    job_exp   = (job.get("experience_level")   or "").lower()
+    exp_mult  = _exp_multiplier(pref_exp, job_exp)
+
+    pref_loc  = (prefs.get("location") or "").lower()
+    loc_mult  = _location_multiplier(pref_loc, job)
+
+    score = raw_score * exp_mult * loc_mult
     score = max(0.0, min(1.0, score))
 
-    # Negative filters
+    # ── Negative filters ──────────────────────────────────────────────────────
     negatives = prefs.get("negatives", [])
     neg_flags = check_negatives(job, negatives)
 
-    # Build match/reject reasons
+    # ── Build match/reject reasons ────────────────────────────────────────────
     match_reasons, reject_reasons = [], []
 
     if neg_flags:
         reject_reasons.extend(neg_flags)
         score = 0.0
+
+    if exp_mult < 0.30:
+        reject_reasons.append(
+            f"Experience mismatch: looking for {pref_exp}, job is {job_exp or 'unknown'}"
+        )
+
+    if loc_mult < 0.30:
+        reject_reasons.append("US-only remote — likely inaccessible for your location")
 
     if skill_sc > 0.4:
         matched = [s for s in user_skills if any(s.lower() in js.lower() for js in job_skills)]
@@ -1981,6 +2242,8 @@ def score_job(job: dict, profile: dict, prefs: dict,
         match_reasons.append("Matches your preferences")
     if rec_sc > 0.8:
         match_reasons.append("Recently posted")
+    if loc_mult > 1.0:
+        match_reasons.append("India-based or India-accessible role")
     if score < MIN_SCORE_THRESHOLD and not reject_reasons:
         reject_reasons.append("Low relevance to profile")
 
@@ -1991,6 +2254,8 @@ def score_job(job: dict, profile: dict, prefs: dict,
         "pref":     round(pref_sc, 3),
         "recency":  round(rec_sc, 3),
         "feedback": round(fb_adj, 3),
+        "exp_mult": round(exp_mult, 3),
+        "loc_mult": round(loc_mult, 3),
     }
 
     return {

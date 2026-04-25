@@ -1,13 +1,14 @@
 <script lang="ts">
   import SearchForm   from "./SearchForm.svelte";
   import JobBoard     from "./JobBoard.svelte";
-  import SiteSidebar  from "./SiteSidebar.svelte";
+  import AgentControlCenter from "./AgentControlCenter.svelte";
   import type { SearchPayload } from "../lib/api";
 
   let boardRef: JobBoard;
-  let sidebarRef: SiteSidebar;
+  let sidebarRef: AgentControlCenter;
   let pendingPayload: SearchPayload | null = null;
   let isSearching = false;
+  let sessionId = "";
 
   function handleSearch(e: CustomEvent<SearchPayload>) {
     pendingPayload = e.detail;
@@ -22,34 +23,22 @@
   }
 </script>
 
-<div style="display:flex;gap:20px;align-items:flex-start;">
+<div class="grid grid-cols-1 items-start gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
 
-  <!-- ── Left Sidebar ─────────────────────────────────────── -->
-  <aside style="
-    width: 280px;
-    flex-shrink: 0;
-    position: sticky;
-    top: 72px;
-    max-height: calc(100vh - 92px);
-    overflow-y: auto;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  ">
-    <SiteSidebar bind:this={sidebarRef} {isSearching} />
-  </aside>
-
-  <!-- ── Main Content ─────────────────────────────────────── -->
-  <main style="flex:1;min-width:0;display:flex;flex-direction:column;gap:16px;">
+  <main class="min-w-0 space-y-5">
     <SearchForm on:search={handleSearch} />
     <JobBoard
       bind:this={boardRef}
       on:searchStart={handleSearchStart}
       on:searchDone={handleSearchDone}
-      on:planUpdate={(e) => sidebarRef?.handlePlanUpdate(e.detail)}
-      on:trace={(e) => sidebarRef?.addTrace(e.detail)}
-      on:siteFound={(e) => sidebarRef?.markSiteFound(e.detail)}
+      on:stats={(e) => sidebarRef?.handleStats(e.detail)}
+      on:session={(e) => { sessionId = e.detail.sessionId; sidebarRef?.setSessionId?.(sessionId); }}
+      on:agentEvent={(e) => sidebarRef?.addAgentEvent?.(e.detail)}
     />
   </main>
+
+  <aside class="lg:sticky lg:top-24 lg:max-h-[calc(100vh-7rem)] lg:overflow-y-auto">
+    <AgentControlCenter bind:this={sidebarRef} {isSearching} className="mb-4" />
+  </aside>
 
 </div>

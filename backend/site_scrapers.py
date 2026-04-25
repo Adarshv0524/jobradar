@@ -15,7 +15,15 @@ import httpx
 from bs4 import BeautifulSoup
 
 from config import REQUEST_TIMEOUT, USER_AGENTS, ADZUNA_APP_ID, ADZUNA_APP_KEY
-from scraper import extract_skills, infer_experience, extract_salary_text, fetch_html, _norm
+from config import JOB_SITES
+from scraper import (
+    extract_skills,
+    infer_experience,
+    extract_salary_text,
+    fetch_html,
+    fetch_paginated_jobs,
+    _norm,
+)
 from playwright_pool import fetch_with_playwright
 
 log = logging.getLogger(__name__)
@@ -344,4 +352,23 @@ async def scrape_site(site_key: str, query: str, max_pages: int = 20) -> List[di
         except Exception as e:
             log.warning("Site scraper %s failed: %s", site_key, e)
             return []
-    return []
+
+    # Generic site pipeline for declarative JOB_SITES entries.
+    cfg = JOB_SITES.get(site_key) if isinstance(JOB_SITES, dict) else None
+    if not cfg:
+        return []
+
+    url_template = cfg.get("url")
+    if not url_template:
+        return []
+
+    site_type = (cfg.get("type") or "html").lower()
+    use_js = site_type == "html_js"
+
+    try:
+        return await fetch_paginated_jobs(
+            base_url=url_template, query=query, max_pages=max_pages, use_js=use_js
+        )
+    except Exception as e:
+        log.warning("Generic site crawl failed (%s): %s", site_key, e)
+        return []

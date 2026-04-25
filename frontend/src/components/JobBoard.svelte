@@ -29,7 +29,7 @@
   // the remote_preference / experience_level the user already selected)
   let filterRemote    = "all";
   let filterLevel     = "all";
-  let sortBy          = "score";
+  let sortBy          = "live";
   let searchTerm      = "";
 
   $: filteredJobs = jobs
@@ -40,7 +40,7 @@
       return true;
     })
     .sort((a, b) => {
-      if (sortBy === "score")   return b.score - a.score;
+      if (sortBy === "score") return b.score - a.score;
       if (sortBy === "recent") {
         const da = a.posted_date || "", db = b.posted_date || "";
         return db.localeCompare(da);
@@ -89,11 +89,12 @@
     try {
       const res = await startSearch(p);
       sessionId = res.session_id;
+      dispatch("session", { sessionId });
 
       es = createSSEStream(
         sessionId,
         (job) => {
-          jobs = [...jobs, job];
+          jobs = [job, ...jobs.filter(existing => existing.id !== job.id)];
           jobsFound = jobs.length;
         },
         (msg) => { statusMsg = msg; },
@@ -109,11 +110,9 @@
           statusMsg = err;
         },
         (trace) => {
-          if (trace.data) {
-            traces = [...traces, { icon: trace.icon || "·", message: trace.message || "", ts: Date.now() }];
-            traces = traces.slice(-20);
-            dispatch("trace", trace);   // FIX: was missing the dispatch here
-          }
+          traces = [...traces, { icon: trace.icon || "·", message: trace.message || "", ts: Date.now() }];
+          traces = traces.slice(-20);
+          dispatch("trace", trace);
         },
         (stats) => {
           jobsFound    = stats.jobs_found ?? jobsFound;
@@ -121,6 +120,7 @@
           tokensTotal  = stats.tokens_total ?? tokensTotal;
           highQuality = stats.high_quality ?? highQuality;
           sitesCount  = stats.sites_count ?? sitesCount;
+          dispatch("stats", stats);
         },
         (site) => {
           if (site.domain && site.jobs_count) {
@@ -129,7 +129,16 @@
           }
           dispatch("siteFound", site);  // FIX: was missing dispatch here too
         },
+        (plan) => { dispatch("planUpdate", plan); },
+        (ev) => { dispatch("siteActive", ev); },
+        (ev) => { dispatch("agentEvent", ev); },
       );
+
+      const persisted = await getSessionJobs(sessionId).catch(() => null);
+      if (persisted?.jobs?.length) {
+        jobs = persisted.jobs;
+        jobsFound = persisted.count ?? persisted.jobs.length;
+      }
     } catch (err: any) {
       status    = "error";
       statusMsg = err.message;
@@ -147,12 +156,12 @@
   $: if (payload) startNewSearch(payload);
 </script>
 
-<div class="space-y-4">
+<div class="space-y-5">
 
   <!-- ── Status bar ─────────────────────────────────── -->
   {#if status !== "idle"}
-    <div class="bg-card border border-border rounded-lg px-4 py-3">
-      <div class="flex items-center justify-between flex-wrap gap-2">
+    <section class="card px-4 py-3 sm:px-5">
+      <div class="flex flex-wrap items-center justify-between gap-3">
         <div class="flex items-center gap-3">
           {#if status === "searching"}
             <span class="pulse-dot"></span>
@@ -161,13 +170,13 @@
           {:else if status === "error"}
             <span style="color:var(--red);font-size:1.1em;">✕</span>
           {/if}
-          <span class="text-sm font-500 text-text">{statusMsg}</span>
+          <span class="text-sm font-medium text-text">{statusMsg}</span>
         </div>
-        <div class="flex items-center gap-4">
+        <div class="grid grid-cols-2 gap-2 sm:flex sm:items-center sm:gap-4">
           {#each [["Jobs", jobsFound], ["Pages", pagesCrawled], ["Sites", sitesCount], ["★ Quality", highQuality]] as [label, val]}
-            <div class="text-center">
-              <div class="text-base font-700 text-text font-mono">{val}</div>
-              <div class="text-[10px] text-muted">{label}</div>
+            <div class="surface min-w-[72px] px-3 py-2 text-center">
+              <div class="font-mono text-base font-semibold text-text-hi">{val}</div>
+              <div class="text-[10px] uppercase tracking-[0.18em] text-text-dim">{label}</div>
             </div>
           {/each}
         </div>
@@ -175,36 +184,31 @@
 
       <!-- Live traces — real-time agent reasoning inline under status bar -->
       {#if status === "searching" && traces.length > 0}
-        <div style="
-          margin-top:8px;padding-top:8px;border-top:1px solid var(--border);
-          font-family:'JetBrains Mono',monospace;font-size:10px;
-          max-height:72px;overflow:hidden;
-        ">
+        <div class="mt-3 max-h-[72px] overflow-hidden border-t border-border pt-3 font-mono text-[10px]">
           {#each traces.slice(-3) as t}
-            <div style="color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+            <div class="overflow-hidden text-ellipsis whitespace-nowrap text-text-dim">
               {t.icon} {t.message}
             </div>
           {/each}
         </div>
       {/if}
-    </div>
+    </section>
   {/if}
 
   <!-- Filter + sort bar -->
   {#if jobs.length > 0}
-    <div class="flex flex-wrap gap-2 items-center pb-2 border-b border-border">
+    <section class="card p-3 sm:p-4">
+    <div class="flex flex-wrap items-center gap-2">
       <input
         bind:value={searchTerm}
         placeholder="Filter results…"
-        class="bg-surface border border-border rounded px-3 py-1.5 text-xs font-mono
-               text-text placeholder:text-muted focus:outline-none focus:border-amber/40 w-44"
+        class="input w-full font-mono text-xs sm:w-48"
       />
 
       <!-- FIX: Remote filter shows active state when auto-set from search -->
       <select
         bind:value={filterRemote}
-        class="bg-surface border border-border rounded px-2 py-1.5 text-xs font-mono
-               focus:outline-none {filterRemote !== 'all' ? 'text-amber border-amber/40' : 'text-dim'}"
+        class="input min-w-[120px] px-3 py-2 font-mono text-xs {filterRemote !== 'all' ? 'text-text-hi border-border-hi' : 'text-text-dim'}"
       >
         <option value="all">All modes</option>
         <option value="remote">Remote</option>
@@ -215,8 +219,7 @@
       <!-- FIX: Level filter shows active state when auto-set from search -->
       <select
         bind:value={filterLevel}
-        class="bg-surface border border-border rounded px-2 py-1.5 text-xs font-mono
-               focus:outline-none {filterLevel !== 'all' ? 'text-amber border-amber/40' : 'text-dim'}"
+        class="input min-w-[120px] px-3 py-2 font-mono text-xs {filterLevel !== 'all' ? 'text-text-hi border-border-hi' : 'text-text-dim'}"
       >
         <option value="all">All levels</option>
         <option value="intern">Intern</option>
@@ -227,27 +230,24 @@
       </select>
 
       <!-- Result count badge -->
-      <span style="
-        font-size:10px;font-family:'JetBrains Mono',monospace;
-        color:var(--text-dim);white-space:nowrap;
-      ">
+      <span class="font-mono text-[10px] whitespace-nowrap text-text-dim">
         {filteredJobs.length} / {jobs.length} shown
         {#if filterRemote !== "all" || filterLevel !== "all" || searchTerm}
           — <button
             on:click={() => { filterRemote="all"; filterLevel="all"; searchTerm=""; }}
-            style="color:var(--accent);background:none;border:none;cursor:pointer;font-size:10px;font-family:inherit;"
+            class="border-none bg-transparent text-text-lo underline-offset-2 hover:text-text-hi hover:underline"
           >clear filters</button>
         {/if}
       </span>
 
       <div class="ml-auto flex gap-1">
-        {#each [["score","Relevance"],["recent","Recent"],["company","Company"]] as [val, label]}
+        {#each [["live","Live"],["score","Relevance"],["recent","Recent"],["company","Company"]] as [val, label]}
           <button
             on:click={() => sortBy = val}
-            class="text-xs font-mono px-2.5 py-1 rounded border transition-colors {
+            class="rounded-full border px-3 py-1.5 text-xs font-mono transition-colors {
               sortBy === val
-                ? 'border-amber/50 text-amber bg-amber/10'
-                : 'border-border text-muted hover:border-dim'
+                ? 'border-border-hi bg-[var(--surface-3)] text-text-hi'
+                : 'border-border text-text-dim hover:border-border-hi'
             }"
           >
             {label}
@@ -255,6 +255,7 @@
         {/each}
       </div>
     </div>
+    </section>
   {/if}
 
   <!-- Job list -->
@@ -270,19 +271,19 @@
       {/each}
     </div>
   {:else if status === "idle"}
-    <div class="text-center py-20 space-y-3">
-      <div class="text-4xl">⌖</div>
-      <p class="font-display text-2xl font-700 text-dim tracking-wide">START SEARCHING</p>
-      <p class="font-mono text-xs text-muted max-w-sm mx-auto">
+    <div class="card px-6 py-16 text-center">
+      <div class="text-4xl text-text-dim">⌖</div>
+      <p class="mt-4 text-2xl font-semibold tracking-wide text-text-hi">Start searching</p>
+      <p class="mx-auto mt-2 max-w-md font-mono text-xs text-text-dim">
         Enter a query above. JobRadar will search across job boards, ATS pages,
         and company career sites — ranking by fit, not just keywords.
       </p>
     </div>
   {:else if status === "searching" && jobs.length === 0}
-    <div class="space-y-2 pt-4">
+    <div class="space-y-3 pt-2">
       {#each Array(4) as _, i}
         <div
-          class="bg-card border border-border rounded-lg p-4 animate-pulse"
+          class="card animate-pulse p-4"
           style="animation-delay: {i * 150}ms"
         >
           <div class="flex gap-3">
@@ -305,11 +306,11 @@
       {/each}
     </div>
   {:else if status === "done" && filteredJobs.length === 0}
-    <div class="text-center py-16">
-      <p class="font-display text-xl text-dim">No results match current filters</p>
+    <div class="card py-14 text-center">
+      <p class="text-xl text-text-dim">No results match current filters</p>
       <button
         on:click={() => { filterRemote="all"; filterLevel="all"; searchTerm=""; }}
-        class="mt-2 font-mono text-xs text-amber hover:underline"
+        class="mt-2 font-mono text-xs text-text-lo hover:text-text-hi hover:underline"
       >
         Clear filters
       </button>

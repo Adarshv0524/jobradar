@@ -89,11 +89,20 @@ async def init_db():
                 FOREIGN KEY (session_id) REFERENCES sessions(id)
             );
 
+            CREATE TABLE IF NOT EXISTS agent_events (
+                id          TEXT PRIMARY KEY,
+                session_id  TEXT NOT NULL,
+                ts          INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_jobs_session  ON jobs(session_id);
             CREATE INDEX IF NOT EXISTS idx_jobs_score    ON jobs(score DESC);
             CREATE INDEX IF NOT EXISTS idx_feedback_job  ON feedback(job_id);
             CREATE INDEX IF NOT EXISTS idx_plan_session  ON crawl_plan(session_id);
             CREATE INDEX IF NOT EXISTS idx_plan_status   ON crawl_plan(status);
+            CREATE INDEX IF NOT EXISTS idx_agent_events_session_ts ON agent_events(session_id, ts);
         """)
         await db.commit()
 
@@ -142,6 +151,47 @@ async def update_session(sid: str, status: str, jobs_found: int = 0, pages_crawl
             (status, jobs_found, pages_crawled, _now(), sid)
         )
         await db.commit()
+
+
+async def bump_session_progress(
+    sid: str,
+    *,
+    jobs_delta: int = 0,
+    pages_delta: int = 0,
+    status: Optional[str] = None,
+):
+    sets = [
+        "jobs_found = jobs_found + ?",
+        "pages_crawled = pages_crawled + ?",
+        "updated_at = ?",
+    ]
+    params: List[object] = [int(jobs_delta or 0), int(pages_delta or 0), _now()]
+    if status:
+        sets.insert(0, "status = ?")
+        params.insert(0, status)
+    params.append(sid)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            f"UPDATE sessions SET {', '.join(sets)} WHERE id=?",
+            tuple(params),
+        )
+        await db.commit()
+
+async def set_session_status(sid: str, status: str):
+    """Update only status/updated_at without touching counters."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE sessions SET status=?, updated_at=? WHERE id=?",
+            (status, _now(), sid)
+        )
+        await db.commit()
+
+async def get_session_status(sid: str) -> Optional[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT status FROM sessions WHERE id=?", (sid,)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else None
 
 
 async def delete_session(sid: str):
@@ -203,7 +253,7 @@ async def get_jobs(sid: str) -> List[dict]:
             SELECT j.*, COALESCE(AVG(f.rating),0) AS avg_feedback
             FROM jobs j
             LEFT JOIN feedback f ON j.id = f.job_id
-            WHERE j.session_id=? AND j.is_duplicate=0 AND j.is_fake=0 AND j.score > 0.1
+            WHERE j.session_id=? AND j.is_duplicate=0 AND j.is_fake=0
             GROUP BY j.id
             ORDER BY (j.score + COALESCE(AVG(f.rating),0)*0.15) DESC
         """, (sid,)) as cur:
@@ -301,6 +351,34 @@ async def get_feedback_profile(sid: str) -> dict:
         "positive_companies": pos_companies,
         "negative_companies": neg_companies,
     }
+
+async def insert_agent_event(session_id: str, event_id: str, ts_ms: int, payload: dict):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO agent_events VALUES (?,?,?,?)",
+            (event_id, session_id, int(ts_ms), json.dumps(payload))
+        )
+        await db.commit()
+
+
+async def get_agent_events(session_id: str, after_ts: int = 0, limit: int = 200) -> List[dict]:
+    lim = max(1, min(int(limit or 200), 1000))
+    aft = int(after_ts or 0)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM agent_events WHERE session_id=? AND ts>? ORDER BY ts ASC LIMIT ?",
+            (session_id, aft, lim)
+        ) as cur:
+            rows = []
+            for r in await cur.fetchall():
+                d = dict(r)
+                try:
+                    d["payload"] = json.loads(d.get("payload_json") or "{}")
+                except Exception:
+                    d["payload"] = {}
+                rows.append(d)
+            return rows
 
 
 

@@ -144,7 +144,9 @@ export default defineConfig({
   let sitesDiscovered: Record<string, number> = {};
   let es: EventSource | null = null;
 
-  // Filters
+  // ── Filters ─────────────────────────────────────────────────────────────────
+  // FIX: Initialize from search payload (were always "all" before, ignoring
+  // the remote_preference / experience_level the user already selected)
   let filterRemote    = "all";
   let filterLevel     = "all";
   let sortBy          = "score";
@@ -154,7 +156,7 @@ export default defineConfig({
     .filter(j => {
       if (filterRemote !== "all" && j.remote_type?.toLowerCase() !== filterRemote) return false;
       if (filterLevel  !== "all" && j.experience_level?.toLowerCase() !== filterLevel)  return false;
-      if (searchTerm && !`${j.title} ${j.company}`.toLowerCase().includes(searchTerm.toLowerCase())) return false;
+      if (searchTerm && !`${j.title} ${j.company} ${j.location ?? ""}`.toLowerCase().includes(searchTerm.toLowerCase())) return false;
       return true;
     })
     .sort((a, b) => {
@@ -183,6 +185,27 @@ export default defineConfig({
     traces      = [];
     sitesDiscovered = {};
 
+    // FIX: Auto-initialize filter bar from the search form's selections
+    // so results are already pre-filtered when they stream in.
+    if (p.remote_preference && p.remote_preference !== "any") {
+      filterRemote = p.remote_preference;   // "remote" | "hybrid" | "on-site"
+    } else {
+      filterRemote = "all";
+    }
+    if (p.experience_level && p.experience_level !== "") {
+      // Map "lead" → "lead" but the filter only has intern/junior/mid/mid-senior/senior
+      // so map gracefully
+      const lvlMap: Record<string, string> = {
+        junior: "junior", intern: "intern", mid: "mid",
+        "mid-level": "mid", senior: "senior", lead: "senior",
+        staff: "senior", principal: "senior",
+      };
+      filterLevel = lvlMap[p.experience_level.toLowerCase()] ?? "all";
+    } else {
+      filterLevel = "all";
+    }
+    searchTerm = "";
+
     try {
       const res = await startSearch(p);
       sessionId = res.session_id;
@@ -209,6 +232,7 @@ export default defineConfig({
           if (trace.data) {
             traces = [...traces, { icon: trace.icon || "·", message: trace.message || "", ts: Date.now() }];
             traces = traces.slice(-20);
+            dispatch("trace", trace);   // FIX: was missing the dispatch here
           }
         },
         (stats) => {
@@ -223,6 +247,7 @@ export default defineConfig({
             sitesDiscovered[site.domain] = (sitesDiscovered[site.domain] || 0) + site.jobs_count;
             sitesDiscovered = sitesDiscovered;
           }
+          dispatch("siteFound", site);  // FIX: was missing dispatch here too
         },
       );
     } catch (err: any) {
@@ -252,9 +277,9 @@ export default defineConfig({
           {#if status === "searching"}
             <span class="pulse-dot"></span>
           {:else if status === "done"}
-            <span class="text-emerald text-lg">✓</span>
+            <span style="color:var(--green);font-size:1.1em;">✓</span>
           {:else if status === "error"}
-            <span class="text-rose text-lg">✕</span>
+            <span style="color:var(--red);font-size:1.1em;">✕</span>
           {/if}
           <span class="text-sm font-500 text-text">{statusMsg}</span>
         </div>
@@ -267,6 +292,21 @@ export default defineConfig({
           {/each}
         </div>
       </div>
+
+      <!-- Live traces — real-time agent reasoning inline under status bar -->
+      {#if status === "searching" && traces.length > 0}
+        <div style="
+          margin-top:8px;padding-top:8px;border-top:1px solid var(--border);
+          font-family:'JetBrains Mono',monospace;font-size:10px;
+          max-height:72px;overflow:hidden;
+        ">
+          {#each traces.slice(-3) as t}
+            <div style="color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+              {t.icon} {t.message}
+            </div>
+          {/each}
+        </div>
+      {/if}
     </div>
   {/if}
 
@@ -280,10 +320,11 @@ export default defineConfig({
                text-text placeholder:text-muted focus:outline-none focus:border-amber/40 w-44"
       />
 
+      <!-- FIX: Remote filter shows active state when auto-set from search -->
       <select
         bind:value={filterRemote}
-        class="bg-surface border border-border rounded px-2 py-1.5 text-xs font-mono text-dim
-               focus:outline-none"
+        class="bg-surface border border-border rounded px-2 py-1.5 text-xs font-mono
+               focus:outline-none {filterRemote !== 'all' ? 'text-amber border-amber/40' : 'text-dim'}"
       >
         <option value="all">All modes</option>
         <option value="remote">Remote</option>
@@ -291,10 +332,11 @@ export default defineConfig({
         <option value="on-site">On-site</option>
       </select>
 
+      <!-- FIX: Level filter shows active state when auto-set from search -->
       <select
         bind:value={filterLevel}
-        class="bg-surface border border-border rounded px-2 py-1.5 text-xs font-mono text-dim
-               focus:outline-none"
+        class="bg-surface border border-border rounded px-2 py-1.5 text-xs font-mono
+               focus:outline-none {filterLevel !== 'all' ? 'text-amber border-amber/40' : 'text-dim'}"
       >
         <option value="all">All levels</option>
         <option value="intern">Intern</option>
@@ -303,6 +345,20 @@ export default defineConfig({
         <option value="mid-senior">Mid-Senior</option>
         <option value="senior">Senior</option>
       </select>
+
+      <!-- Result count badge -->
+      <span style="
+        font-size:10px;font-family:'JetBrains Mono',monospace;
+        color:var(--text-dim);white-space:nowrap;
+      ">
+        {filteredJobs.length} / {jobs.length} shown
+        {#if filterRemote !== "all" || filterLevel !== "all" || searchTerm}
+          — <button
+            on:click={() => { filterRemote="all"; filterLevel="all"; searchTerm=""; }}
+            style="color:var(--accent);background:none;border:none;cursor:pointer;font-size:10px;font-family:inherit;"
+          >clear filters</button>
+        {/if}
+      </span>
 
       <div class="ml-auto flex gap-1">
         {#each [["score","Relevance"],["recent","Recent"],["company","Company"]] as [val, label]}
@@ -328,12 +384,12 @@ export default defineConfig({
         <JobCard
           {job}
           index={i}
+          {sessionId}
           on:feedback={(e) => handleFeedback(job.id, e.detail.rating)}
         />
       {/each}
     </div>
   {:else if status === "idle"}
-    <!-- Empty state -->
     <div class="text-center py-20 space-y-3">
       <div class="text-4xl">⌖</div>
       <p class="font-display text-2xl font-700 text-dim tracking-wide">START SEARCHING</p>
@@ -420,6 +476,30 @@ export default defineConfig({
     "on-site": "badge-neutral",
   }[job.remote_type?.toLowerCase() ?? ""] ?? "badge-neutral";
 
+  // FIX: Experience level badge — shown prominently in card header
+  $: expLabel = {
+    intern:       "Intern",
+    fresher:      "Fresher",
+    junior:       "Junior",
+    mid:          "Mid",
+    "mid-senior": "Mid-Sr",
+    senior:       "Senior",
+    lead:         "Lead",
+    staff:        "Staff",
+    principal:    "Principal",
+  }[job.experience_level?.toLowerCase() ?? ""] ?? (job.experience_level ?? "");
+
+  $: expBadgeStyle = (() => {
+    const lvl = job.experience_level?.toLowerCase() ?? "";
+    if (lvl === "intern" || lvl === "fresher") return "color:#a78bfa;border-color:rgba(167,139,250,0.3);background:rgba(167,139,250,0.08);";
+    if (lvl === "junior")     return "color:var(--green);border-color:rgba(34,197,94,0.3);background:var(--green-lo);";
+    if (lvl === "mid")        return "color:var(--blue);border-color:rgba(96,165,250,0.3);background:var(--blue-lo);";
+    if (lvl === "mid-senior") return "color:var(--blue);border-color:rgba(96,165,250,0.3);background:var(--blue-lo);";
+    if (lvl === "senior")     return "color:var(--accent);border-color:var(--accent-hi);background:var(--accent-lo);";
+    if (["lead","staff","principal"].includes(lvl)) return "color:var(--red);border-color:rgba(248,113,113,0.3);background:var(--red-lo);";
+    return "color:var(--text-dim);border-color:var(--border);background:var(--surface);";
+  })();
+
   function fmt(d: string): string {
     if (!d) return "";
     try { return new Date(d).toLocaleDateString("en-US", { month: "short", day: "numeric" }); }
@@ -430,6 +510,10 @@ export default defineConfig({
     job.source_type === "jsonld"       ? "structured" :
     job.source_type === "detail_page"  ? "detail page" :
     job.source_type?.startsWith("api") ? "API" : "scraped";
+
+  // FIX: show exp_mult and loc_mult warnings if they pulled the score down
+  $: expWarn = (job.score_breakdown as any)?.exp_mult < 0.5;
+  $: locWarn = (job.score_breakdown as any)?.loc_mult < 0.5;
 </script>
 
 <article
@@ -464,6 +548,15 @@ export default defineConfig({
       <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:6px;">
         <span class="mono" style="font-size:10px;color:var(--text-dim);">#{String(index+1).padStart(2,"0")}</span>
         <span class="badge {remoteBadgeClass}">{remoteLabel}</span>
+
+        <!-- FIX: Experience level badge in card header (was only in expanded footer) -->
+        {#if expLabel}
+          <span
+            class="badge"
+            style={expBadgeStyle}
+          >{expLabel}</span>
+        {/if}
+
         {#if job.posted_date}
           <span class="mono" style="font-size:10px;color:var(--text-dim);">{fmt(job.posted_date)}</span>
         {/if}
@@ -502,11 +595,21 @@ export default defineConfig({
         </div>
       {/if}
 
-      <!-- Match reason -->
-      {#if job.match_reasons?.length && !expanded}
-        <p style="font-size:11px;color:var(--green);font-family:'JetBrains Mono',monospace;">
-          ✓ {job.match_reasons[0]}
-        </p>
+      <!-- Match reason / warnings -->
+      {#if !expanded}
+        {#if locWarn}
+          <p style="font-size:11px;color:var(--red);font-family:'JetBrains Mono',monospace;">
+            ⚠ US-only remote — may not be accessible from your location
+          </p>
+        {:else if expWarn}
+          <p style="font-size:11px;color:var(--accent);font-family:'JetBrains Mono',monospace;">
+            ⚠ Experience level mismatch
+          </p>
+        {:else if job.match_reasons?.length}
+          <p style="font-size:11px;color:var(--green);font-family:'JetBrains Mono',monospace;">
+            ✓ {job.match_reasons[0]}
+          </p>
+        {/if}
       {/if}
     </div>
 
@@ -587,20 +690,34 @@ export default defineConfig({
       <!-- Score breakdown -->
       {#if job.score_breakdown && Object.keys(job.score_breakdown).length}
         <p style="font-size:10px;font-weight:600;color:var(--text-dim);letter-spacing:0.07em;margin-bottom:8px;">SIGNAL BREAKDOWN</p>
-        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:12px;">
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:12px;">
           {#each Object.entries(job.score_breakdown) as [key, val]}
             {@const n = Number(val)}
+            <!-- FIX: show exp_mult and loc_mult with distinct colors -->
+            {@const isMult = key === "exp_mult" || key === "loc_mult"}
             <div class="surface" style="padding:8px;text-align:center;">
               <p style="font-size:10px;color:var(--text-dim);letter-spacing:0.06em;text-transform:uppercase;margin:0 0 2px;">{key}</p>
-              <p class="mono" style="font-size:14px;font-weight:600;margin:0;color:{n>0.5?'var(--green)':n>0.25?'var(--accent)':'var(--text-dim)'}">
-                {Math.round(n*100)}%
+              <p class="mono" style="font-size:13px;font-weight:600;margin:0;
+                color:{isMult
+                  ? (n < 0.5 ? 'var(--red)' : n < 0.85 ? 'var(--accent)' : 'var(--green)')
+                  : (n>0.5?'var(--green)':n>0.25?'var(--accent)':'var(--text-dim)')}">
+                {isMult ? (n < 1 ? `×${n.toFixed(2)}` : "✓") : Math.round(n*100) + "%"}
               </p>
             </div>
           {/each}
         </div>
       {/if}
 
-      <!-- Match reasons -->
+      <!-- Match / reject reasons -->
+      {#if job.reject_reasons?.length}
+        <p style="font-size:10px;font-weight:600;color:var(--text-dim);letter-spacing:0.07em;margin-bottom:6px;">WHY IT'S PENALISED</p>
+        <div style="margin-bottom:12px;">
+          {#each job.reject_reasons as r}
+            <p style="font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--red);margin:2px 0;">⚠ {r}</p>
+          {/each}
+        </div>
+      {/if}
+
       {#if job.match_reasons?.length}
         <p style="font-size:10px;font-weight:600;color:var(--text-dim);letter-spacing:0.07em;margin-bottom:6px;">WHY IT MATCHED</p>
         <div style="margin-bottom:12px;">
@@ -619,7 +736,7 @@ export default defineConfig({
       {/if}
 
       <div style="display:flex;gap:12px;font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--text-dim);">
-        <span>src: {job.source_domain}</span>
+      <span>src: {job.source_domain}</span>
         {#if job.experience_level}
           <span>· {job.experience_level}</span>
         {/if}

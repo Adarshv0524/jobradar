@@ -79,6 +79,26 @@ def text_similarity(a: str, b: str) -> float:
     return len(a_g & b_g) / len(a_g | b_g)
 
 
+def _token_overlap_score(a: str, b: str) -> float:
+    """
+    Fast, high-precision overlap score for role/title matching.
+    Helps avoid low TF-IDF scores for short strings like "data engineer".
+    """
+    if not a or not b:
+        return 0.0
+    stop = {
+        "the", "and", "or", "of", "to", "in", "for", "with", "a", "an",
+        "remote", "hybrid", "onsite", "on-site", "full-time", "part-time",
+        "engineer",  # keep overlap meaningful; "engineer" is too generic
+    }
+    ta = [t for t in re.findall(r"[a-z0-9]+", a.lower()) if t and t not in stop]
+    tb = set(re.findall(r"[a-z0-9]+", b.lower()))
+    if not ta:
+        return 0.0
+    hit = sum(1 for t in ta if t in tb)
+    return max(0.0, min(1.0, hit / max(len(ta), 1)))
+
+
 # ── Skill matching ────────────────────────────────────────────────────────────
 
 def skill_overlap(user_skills: List[str], job_skills: List[str]) -> float:
@@ -344,6 +364,11 @@ def score_job(job: dict, profile: dict, prefs: dict,
     # 3. Title match
     pref_role  = prefs.get("role", "")
     title_sc   = text_similarity(pref_role, title) if pref_role else semantic * 0.8
+    if pref_role:
+        title_sc = max(title_sc, _token_overlap_score(pref_role, title))
+        # If the role tokens match strongly, treat as near-perfect title alignment.
+        if title_sc >= 0.95:
+            title_sc = 1.0
 
     # 4. Preference match (remote + salary only)
     pref_sc = preference_score(job, prefs)
@@ -372,12 +397,25 @@ def score_job(job: dict, profile: dict, prefs: dict,
             fb_adj -= 0.15
 
     # ── Weighted composite (pre-multiplier) ───────────────────────────────────
+    # Dynamic weighting:
+    # When the user hasn't uploaded a resume / skills, the system should still
+    # produce high-confidence matches based on role-title + preferences.
+    w_sem   = 0.25 if len(profile_text) >= 60 else 0.10
+    w_skill = 0.30 if user_skills and job_skills else 0.0
+    w_title = 0.30 if pref_role else 0.20
+    w_pref  = 0.20
+    w_rec   = 0.10
+
+    total_w = w_sem + w_skill + w_title + w_pref + w_rec
+    if total_w <= 0:
+        total_w = 1.0
+
     raw_score = (
-        0.25 * semantic
-        + 0.30 * skill_sc          # INCREASED from 0.25
-        + 0.20 * title_sc
-        + 0.15 * pref_sc
-        + 0.10 * rec_sc
+        (w_sem / total_w) * semantic
+        + (w_skill / total_w) * skill_sc
+        + (w_title / total_w) * title_sc
+        + (w_pref / total_w) * pref_sc
+        + (w_rec / total_w) * rec_sc
         + src_bonus
         + fb_adj
     )
