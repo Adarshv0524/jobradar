@@ -1,1 +1,1 @@
-testing
+Making an intelligent job search tool for myself, which can scrap web and find the most relevent stuff for me
