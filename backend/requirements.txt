@@ -1,0 +1,20 @@
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+httpx[http2]==0.27.0
+beautifulsoup4==4.12.3
+lxml==5.2.2
+duckduckgo_search==6.1.0
+aiosqlite==0.20.0
+sse-starlette==2.1.0
+pydantic==2.7.1
+python-multipart==0.0.9
+scikit-learn==1.4.2
+pdfplumber==0.11.0
+openai>=1.40.0
+python-dotenv==1.0.1
+
+# Playwright (JS-heavy sites) — after pip install run: playwright install chromium
+playwright==1.44.0
+
+# Optional: much better semantic ranking
+sentence-transformers==3.0.0

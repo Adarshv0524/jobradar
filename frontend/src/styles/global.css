@@ -1,0 +1,233 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg:        #0d0e10;
+  --surface:   #13151a;
+  --elevated:  #1a1d24;
+  --card:      #1e2028;
+  --border:    #2a2d36;
+  --border-hi: #3a3d48;
+  --accent:    #f59e0b;
+  --accent-lo: rgba(245,158,11,0.12);
+  --accent-hi: rgba(245,158,11,0.25);
+  --green:     #22c55e;
+  --green-lo:  rgba(34,197,94,0.12);
+  --blue:      #60a5fa;
+  --blue-lo:   rgba(96,165,250,0.12);
+  --red:       #f87171;
+  --red-lo:    rgba(248,113,113,0.12);
+  --text-hi:   #f1f2f4;
+  --text:      #c9ccd4;
+  --text-lo:   #8891a4;
+  --text-dim:  #555b6e;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  background-color: var(--bg);
+  color:            var(--text);
+  font-family:      "Inter", system-ui, -apple-system, sans-serif;
+  font-size:        14px;
+  line-height:      1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar       { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+/* ── Utility classes ── */
+
+.card {
+  background:   var(--card);
+  border:       1px solid var(--border);
+  border-radius: 8px;
+}
+
+.card-hover {
+  transition: border-color 0.15s, background 0.15s, box-shadow 0.15s;
+}
+.card-hover:hover {
+  border-color: var(--border-hi);
+  background:   var(--elevated);
+  box-shadow:   0 4px 24px rgba(0,0,0,0.3);
+}
+
+.surface {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.badge {
+  display:      inline-flex;
+  align-items:  center;
+  gap:          4px;
+  padding:      2px 8px;
+  border-radius: 4px;
+  font-size:    11px;
+  font-weight:  500;
+  font-family:  "JetBrains Mono", monospace;
+  letter-spacing: 0.02em;
+  border:       1px solid;
+}
+
+.badge-accent   { color: var(--accent); border-color: var(--accent-hi); background: var(--accent-lo); }
+.badge-green    { color: var(--green);  border-color: rgba(34,197,94,0.3); background: var(--green-lo); }
+.badge-blue     { color: var(--blue);   border-color: rgba(96,165,250,0.3); background: var(--blue-lo); }
+.badge-neutral  { color: var(--text-lo); border-color: var(--border); background: var(--surface); }
+.badge-red      { color: var(--red);    border-color: rgba(248,113,113,0.3); background: var(--red-lo); }
+
+.skill-tag {
+  display:      inline-block;
+  padding:      2px 7px;
+  border-radius: 3px;
+  font-size:    11px;
+  font-family:  "JetBrains Mono", monospace;
+  background:   rgba(96,165,250,0.08);
+  border:       1px solid rgba(96,165,250,0.2);
+  color:        var(--blue);
+}
+
+.score-bar-track {
+  height:       2px;
+  background:   var(--border);
+  border-radius: 2px;
+  overflow:     hidden;
+}
+.score-bar-fill {
+  height:       100%;
+  border-radius: 2px;
+  transition:   width 0.7s cubic-bezier(0.4,0,0.2,1);
+}
+
+.btn {
+  display:      inline-flex;
+  align-items:  center;
+  gap:          6px;
+  padding:      7px 14px;
+  border-radius: 6px;
+  font-size:    13px;
+  font-weight:  500;
+  cursor:       pointer;
+  transition:   all 0.15s;
+  border:       1px solid;
+  font-family:  inherit;
+}
+
+.btn-primary {
+  background:   var(--accent);
+  border-color: var(--accent);
+  color:        #0d0e10;
+  font-weight:  600;
+}
+.btn-primary:hover {
+  background:   #fbbf24;
+  border-color: #fbbf24;
+}
+.btn-primary:disabled {
+  opacity: 0.5;
+  cursor:  not-allowed;
+}
+
+.btn-ghost {
+  background:   transparent;
+  border-color: var(--border);
+  color:        var(--text-lo);
+}
+.btn-ghost:hover {
+  background:   var(--elevated);
+  border-color: var(--border-hi);
+  color:        var(--text);
+}
+
+.input {
+  background:   var(--surface);
+  border:       1px solid var(--border);
+  border-radius: 6px;
+  color:        var(--text-hi);
+  font-family:  inherit;
+  font-size:    14px;
+  padding:      8px 12px;
+  width:        100%;
+  transition:   border-color 0.15s;
+  outline:      none;
+}
+.input::placeholder { color: var(--text-dim); }
+.input:focus {
+  border-color: var(--accent-hi);
+  box-shadow:   0 0 0 3px var(--accent-lo);
+}
+.input:hover { border-color: var(--border-hi); }
+
+.label {
+  font-size:    11px;
+  font-weight:  600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color:        var(--text-lo);
+  display:      block;
+  margin-bottom: 5px;
+}
+
+/* Pulse indicator */
+.pulse-dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+  animation: pulse-anim 2s ease-in-out infinite;
+}
+@keyframes pulse-anim {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.4; transform: scale(1.4); }
+}
+
+/* Fade-in animation */
+.fade-in {
+  animation: fadeIn 0.3s ease-out both;
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Slide-in for sidebar items */
+.slide-in {
+  animation: slideIn 0.25s ease-out both;
+}
+@keyframes slideIn {
+  from { opacity: 0; transform: translateX(-6px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+/* Status dots */
+.dot-pending  { color: var(--text-dim); }
+.dot-running  { color: var(--accent); }
+.dot-done     { color: var(--green); }
+.dot-failed   { color: var(--red); }
+
+/* Divider */
+.divider {
+  height: 1px;
+  background: var(--border);
+  margin: 16px 0;
+}
+
+/* Monospace text */
+.mono { font-family: "JetBrains Mono", monospace; }
+
+/* Truncate */
+.truncate-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
